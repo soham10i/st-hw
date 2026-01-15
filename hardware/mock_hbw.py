@@ -90,7 +90,7 @@ class MockHBW:
         if not MQTT_AVAILABLE:
             return
         
-        self.mqtt_client = mqtt.Client(client_id=f"mock_{self.device_id}")
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"mock_{self.device_id}")
         self.mqtt_client.on_connect = self._on_mqtt_connect
         self.mqtt_client.on_message = self._on_mqtt_message
         
