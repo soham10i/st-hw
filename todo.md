@@ -218,3 +218,49 @@
 - [x] Document camera controls and presets
 - [x] Document customization options
 - [x] Update requirements.txt with 3D dependencies
+
+
+## Phase 5: Command Queue Architecture & Analytics Upgrade
+
+### Codebase Cleanup
+- [x] Remove 3D visualization files (visualization_3d.py, visualization_3d_pyvista.py)
+- [x] Remove standalone 3D demo (demo_3d_visualization.py)
+- [x] Remove 3D documentation (docs/3D_VISUALIZATION.md)
+- [x] Clean up dashboard navigation links
+
+### Command Queue Architecture
+- [x] Update API `/order/process` with auto-slot selection
+- [x] Make `source_slot` optional (auto-selects first RAW_DOUGH cookie)
+- [x] Add optional `flavor` filter for auto-selection
+- [x] Update command status to `PENDING` for controller processing
+- [x] Rewrite `controller/main_controller.py` with Command Queue pattern
+- [x] Implement database polling for PENDING commands
+- [x] Add `IN_PROGRESS`, `COMPLETED`, `FAILED` status updates
+- [x] Implement PROCESS command execution (8-step workflow)
+- [x] Add energy logging per command execution
+
+### Synthetic Data Generator
+- [x] Create `scripts/generate_history.py`
+- [x] Generate 30 days of historical data (~50 orders/day)
+- [x] Inject Day 12 Motor Failure scenario (CONV_M1 spike to 4.5A, health 40%)
+- [x] Inject Day 25 Sensor Drift scenario (CONV_L2_PROCESS ghost readings)
+- [x] Generate energy consumption logs (V x A x Time)
+- [x] Generate motor health degradation telemetry
+- [x] Generate predictive maintenance alerts when health_score < 0.5
+- [x] Add command-line arguments (--days, --orders-per-day)
+
+### Analytics Dashboard Upgrade
+- [x] Add database integration for telemetry/energy/alerts
+- [x] Add Motor Health tab with degradation chart
+- [x] Add breakdown scenario summary (Day 12, Day 25)
+- [x] Add vertical line markers for breakdown events on charts
+- [x] Add Alerts & Events tab with timeline
+- [x] Add Predictive Insights tab with health forecast
+- [x] Add maintenance recommendations based on health scores
+- [x] Update KPI cards with critical alerts count
+
+### Documentation
+- [x] Update README.md with Command Queue architecture
+- [x] Create docs/COMMAND_QUEUE.md with workflow documentation
+- [x] Update project structure in README
+- [x] Document synthetic data generator usage

@@ -1,6 +1,11 @@
 """
-STF Digital Twin - Main Controller
-FSM logic, command translation, safety interlocks, and energy logging
+STF Digital Twin - Main Controller with Command Queue Architecture
+
+This controller implements the "Global Controller" pattern:
+    User (UI) -> API (Queue) -> Controller (Poll) -> MQTT (Execute) -> Hardware (Physics)
+
+The controller polls the database for PENDING commands and executes them sequentially,
+ensuring proper coordination between subsystems and preventing race conditions.
 """
 
 import asyncio
@@ -8,6 +13,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 from typing import Optional, Dict, List
 
@@ -25,36 +31,42 @@ except ImportError:
 API_URL = os.environ.get("STF_API_URL", "http://localhost:8000")
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))  # seconds
 
-# Coordinate mapping (slot name -> physical X/Y)
+# Coordinate mapping (slot name -> physical X/Y in mm)
 SLOT_COORDINATES = {
     "A1": (100, 100), "A2": (200, 100), "A3": (300, 100),
     "B1": (100, 200), "B2": (200, 200), "B3": (300, 200),
     "C1": (100, 300), "C2": (200, 300), "C3": (300, 300),
 }
 
-# Safety zones (areas where collision prevention is active)
-SAFETY_ZONES = {
-    "PICKUP": {"x_min": 0, "x_max": 50, "y_min": 0, "y_max": 50},
-    "DROPOFF": {"x_min": 350, "x_max": 400, "y_min": 350, "y_max": 400},
+# Zone coordinates
+ZONES = {
+    "PICKUP": (25, 25),       # Cookie pickup zone
+    "CONVEYOR": (350, 200),   # Conveyor handoff zone
+    "OVEN": (350, 100),       # Oven zone
+    "HOME": (0, 0),           # Home position
 }
 
 
 class ControllerState(Enum):
-    """Finite State Machine states"""
+    """Finite State Machine states for the controller."""
     IDLE = auto()
-    MOVING_TO_PICKUP = auto()
-    PICKING = auto()
+    POLLING = auto()
+    EXECUTING = auto()
     MOVING_TO_SLOT = auto()
+    PICKING = auto()
+    MOVING_TO_CONVEYOR = auto()
     PLACING = auto()
-    MOVING_TO_DROPOFF = auto()
-    RETRIEVING = auto()
+    WAITING_OVEN = auto()
+    RETURNING = auto()
     ERROR = auto()
     EMERGENCY_STOP = auto()
 
 
 @dataclass
 class HardwarePosition:
+    """Tracks the current position and status of a hardware device."""
     device_id: str
     x: float
     y: float
@@ -63,41 +75,61 @@ class HardwarePosition:
 
 
 @dataclass
-class Command:
-    command_type: str  # STORE, RETRIEVE
-    slot_name: str
-    flavor: Optional[str] = None
-    batch_uuid: Optional[str] = None
+class QueuedCommand:
+    """Represents a command from the database queue."""
+    id: int
+    command_type: str
+    target_slot: Optional[str]
+    payload: dict
+    status: str
+    created_at: datetime
 
 
 class MainController:
     """
-    Main controller for the STF Digital Twin.
-    Implements FSM logic, translates high-level commands to hardware instructions,
-    and enforces safety interlocks.
+    Main Controller for the STF Digital Twin.
+    
+    Implements the Command Queue architecture where:
+    1. API endpoints create commands with status='PENDING'
+    2. Controller polls for PENDING commands
+    3. Commands are executed sequentially
+    4. Status is updated to 'COMPLETED' or 'FAILED'
+    
+    Attributes
+    ----------
+    state : ControllerState
+        Current FSM state of the controller.
+    http_client : httpx.AsyncClient
+        Async HTTP client for API communication.
+    mqtt_client : mqtt.Client
+        MQTT client for hardware communication.
+    running : bool
+        Flag indicating if the controller loop is running.
     """
     
     def __init__(self):
         self.state = ControllerState.IDLE
-        self.current_command: Optional[Command] = None
+        self.current_command: Optional[QueuedCommand] = None
         self.hardware_positions: Dict[str, HardwarePosition] = {}
         self.mqtt_client: Optional[mqtt.Client] = None
         self.http_client: Optional[httpx.AsyncClient] = None
         self.running = False
         
-        # Safety tracking
-        self.collision_prevention_active = False
+        # Safety flags
         self.emergency_stop_active = False
         
         # Energy tracking
         self.total_energy_joules = 0.0
-        
-        # Command queue
-        self.command_queue: List[Command] = []
+        self.command_start_time: Optional[float] = None
+    
+    # =========================================================================
+    # MQTT Setup and Handlers
+    # =========================================================================
     
     def setup_mqtt(self):
-        """Initialize MQTT client"""
+        """Initialize MQTT client for hardware communication."""
         if not MQTT_AVAILABLE:
+            print("[Controller] MQTT not available - running in simulation mode")
             return
         
         self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="stf_controller")
@@ -107,68 +139,42 @@ class MainController:
         try:
             self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
             self.mqtt_client.loop_start()
-            print(f"[Controller] Connected to MQTT broker")
+            print(f"[Controller] Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
         except Exception as e:
             print(f"[Controller] MQTT connection failed: {e}")
             self.mqtt_client = None
     
     def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties=None):
-        """
-        MQTT connection callback handler for paho-mqtt v2.x.
-
-        Establishes subscription to hardware status and command topics upon successful connection.
-
-        Topics subscribed:
-            - stf/hbw/status: High-Bay Warehouse (HBW) status updates
-            - stf/vgr/status: Vacuum Gripper Robot (VGR) status updates
-            - stf/conveyor/status: Conveyor system status updates
-            - stf/global/cmd/#: Global command topic (wildcard subscription for all command subtopics)
-
-        Args:
-            client: MQTT client instance
-            userdata: User-defined data passed to callbacks
-            flags: Response flags sent by broker
-            reason_code: Connection result code (0 or "Success" indicates successful connection)
-            properties: MQTT v5.0 properties (optional)
-
-        Returns:
-            None
-        """
-        """MQTT connection callback (paho-mqtt v2.x compatible)"""
+        """Handle MQTT connection and subscribe to topics."""
         if reason_code == 0 or str(reason_code) == "Success":
-            # Subscribe to hardware status topics
             topics = [
                 "stf/hbw/status",
-                "stf/vgr/status",
+                "stf/vgr/status", 
                 "stf/conveyor/status",
-                "stf/global/cmd/#",
+                "stf/global/emergency",
             ]
             for topic in topics:
                 client.subscribe(topic)
-                print(f"[Controller] Subscribed to {topic}")
+            print("[Controller] Subscribed to hardware status topics")
     
     def _on_mqtt_message(self, client, userdata, msg):
-        """Handle incoming MQTT messages"""
+        """Handle incoming MQTT messages from hardware."""
         try:
             payload = json.loads(msg.payload.decode())
             topic = msg.topic
             
             if "/status" in topic:
                 self._update_hardware_position(payload)
-            elif "emergency_stop" in topic:
+            elif "emergency" in topic:
                 self._handle_emergency_stop()
-            elif "store" in topic:
-                self._queue_store_command(payload)
-            elif "retrieve" in topic:
-                self._queue_retrieve_command(payload)
                 
         except json.JSONDecodeError:
-            print(f"[Controller] Invalid JSON in message")
+            print(f"[Controller] Invalid JSON in MQTT message")
         except Exception as e:
-            print(f"[Controller] Error handling message: {e}")
+            print(f"[Controller] Error handling MQTT message: {e}")
     
     def _update_hardware_position(self, payload: dict):
-        """Update tracked hardware position"""
+        """Update tracked hardware position from MQTT status."""
         device_id = payload.get("device_id")
         if device_id:
             self.hardware_positions[device_id] = HardwarePosition(
@@ -180,284 +186,454 @@ class MainController:
             )
     
     def _handle_emergency_stop(self):
-        """Handle emergency stop command"""
+        """Activate emergency stop mode."""
         self.emergency_stop_active = True
         self.state = ControllerState.EMERGENCY_STOP
         
-        # Send stop commands to all hardware
         if self.mqtt_client:
             for device in ["hbw", "vgr", "conveyor"]:
                 self.mqtt_client.publish(f"stf/{device}/cmd/stop", json.dumps({"action": "stop"}))
         
-        print("[Controller] EMERGENCY STOP ACTIVATED")
+        print("[Controller] *** EMERGENCY STOP ACTIVATED ***")
     
-    def _queue_store_command(self, payload: dict):
-        """Queue a store command"""
-        slot_name = payload.get("slot_name")
-        flavor = payload.get("flavor", "CHOCO")
-        
-        if slot_name and slot_name in SLOT_COORDINATES:
-            cmd = Command(
-                command_type="STORE",
-                slot_name=slot_name,
-                flavor=flavor,
-            )
-            self.command_queue.append(cmd)
-            print(f"[Controller] Queued STORE command for {slot_name}")
+    # =========================================================================
+    # Hardware Command Methods
+    # =========================================================================
     
-    def _queue_retrieve_command(self, payload: dict):
-        """Queue a retrieve command"""
-        slot_name = payload.get("slot_name")
-        
-        if slot_name and slot_name in SLOT_COORDINATES:
-            cmd = Command(
-                command_type="RETRIEVE",
-                slot_name=slot_name,
-            )
-            self.command_queue.append(cmd)
-            print(f"[Controller] Queued RETRIEVE command for {slot_name}")
-    
-    def _check_collision(self, target_x: float, target_y: float, device_id: str) -> bool:
+    async def _send_move_command(self, device_id: str, x: float, y: float) -> bool:
         """
-        Check if moving to target position would cause collision.
-        Returns True if collision detected (movement should be blocked).
+        Send move command to hardware via MQTT and API.
+        
+        Parameters
+        ----------
+        device_id : str
+            Target device (e.g., 'HBW', 'VGR').
+        x : float
+            Target X position in mm.
+        y : float
+            Target Y position in mm.
+        
+        Returns
+        -------
+        bool
+            True if command was sent successfully.
         """
-        for other_id, pos in self.hardware_positions.items():
-            if other_id == device_id:
-                continue
-            
-            # Check if other device is within safety distance
-            distance = ((pos.x - target_x) ** 2 + (pos.y - target_y) ** 2) ** 0.5
-            if distance < 50:  # Safety distance in mm
-                print(f"[Controller] COLLISION PREVENTION: {device_id} blocked from ({target_x}, {target_y})")
-                self.collision_prevention_active = True
-                return True
+        # Update API
+        try:
+            await self.http_client.post(
+                f"{API_URL}/hardware/state",
+                json={"device_id": device_id, "x": x, "y": y, "z": 0, "status": "MOVING"}
+            )
+        except Exception as e:
+            print(f"[Controller] API update error: {e}")
         
-        self.collision_prevention_active = False
-        return False
-    
-    def _send_move_command(self, device_id: str, x: float, y: float):
-        """Send move command to hardware via MQTT"""
-        if self._check_collision(x, y, device_id):
-            print(f"[Controller] Move blocked due to collision prevention")
-            return False
-        
+        # Send MQTT command
         if self.mqtt_client:
             topic = f"stf/{device_id.lower()}/cmd/move"
             payload = {"targetX": x, "targetY": y}
             self.mqtt_client.publish(topic, json.dumps(payload))
-            print(f"[Controller] Sent move command to {device_id}: ({x}, {y})")
-            return True
-        return False
+        
+        print(f"[Controller] MOVE {device_id} -> ({x}, {y})")
+        return True
     
-    def _send_gripper_command(self, device_id: str, action: str):
-        """Send gripper command to hardware via MQTT"""
+    async def _send_gripper_command(self, device_id: str, action: str):
+        """Send gripper command (open/close/extend/retract)."""
         if self.mqtt_client:
             topic = f"stf/{device_id.lower()}/cmd/gripper"
             payload = {"action": action}
             self.mqtt_client.publish(topic, json.dumps(payload))
-            print(f"[Controller] Sent gripper {action} to {device_id}")
+        
+        print(f"[Controller] GRIPPER {device_id} -> {action}")
     
-    async def _execute_store_command(self, cmd: Command):
-        """Execute a store command through FSM states"""
-        target_coords = SLOT_COORDINATES.get(cmd.slot_name)
-        if not target_coords:
-            print(f"[Controller] Invalid slot: {cmd.slot_name}")
-            return
+    async def _send_conveyor_command(self, action: str, speed: float = 100):
+        """Send conveyor belt command."""
+        if self.mqtt_client:
+            topic = "stf/conveyor/cmd/belt"
+            payload = {"action": action, "speed": speed}
+            self.mqtt_client.publish(topic, json.dumps(payload))
         
-        target_x, target_y = target_coords
-        
-        # State: MOVING_TO_PICKUP
-        self.state = ControllerState.MOVING_TO_PICKUP
-        print(f"[Controller] State: MOVING_TO_PICKUP")
-        
-        # Move HBW to pickup zone
-        self._send_move_command("HBW", 25, 25)
-        await asyncio.sleep(2)  # Wait for movement
-        
-        # State: PICKING
-        self.state = ControllerState.PICKING
-        print(f"[Controller] State: PICKING")
-        
-        self._send_gripper_command("HBW", "close")
-        await asyncio.sleep(0.5)
-        
-        # State: MOVING_TO_SLOT
-        self.state = ControllerState.MOVING_TO_SLOT
-        print(f"[Controller] State: MOVING_TO_SLOT ({cmd.slot_name})")
-        
-        self._send_move_command("HBW", target_x, target_y)
-        await asyncio.sleep(3)  # Wait for movement
-        
-        # State: PLACING
-        self.state = ControllerState.PLACING
-        print(f"[Controller] State: PLACING")
-        
-        self._send_gripper_command("HBW", "open")
-        await asyncio.sleep(0.5)
-        
-        # Return to idle
-        self.state = ControllerState.IDLE
-        print(f"[Controller] STORE complete for {cmd.slot_name}")
-        
-        # Log to API
-        await self._log_command_completion(cmd)
+        print(f"[Controller] CONVEYOR -> {action}")
     
-    async def _execute_retrieve_command(self, cmd: Command):
-        """Execute a retrieve command through FSM states"""
-        target_coords = SLOT_COORDINATES.get(cmd.slot_name)
-        if not target_coords:
-            print(f"[Controller] Invalid slot: {cmd.slot_name}")
-            return
+    async def _wait_for_idle(self, device_id: str, timeout: float = 30.0) -> bool:
+        """
+        Wait for a device to return to IDLE status.
         
-        target_x, target_y = target_coords
+        Parameters
+        ----------
+        device_id : str
+            Device to wait for.
+        timeout : float
+            Maximum wait time in seconds.
         
-        # State: MOVING_TO_SLOT
-        self.state = ControllerState.MOVING_TO_SLOT
-        print(f"[Controller] State: MOVING_TO_SLOT ({cmd.slot_name})")
+        Returns
+        -------
+        bool
+            True if device is IDLE, False if timeout.
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # Check API for current status
+            try:
+                response = await self.http_client.get(f"{API_URL}/hardware/states")
+                if response.status_code == 200:
+                    states = response.json()
+                    for hw in states:
+                        if hw["device_id"] == device_id and hw["status"] == "IDLE":
+                            return True
+            except Exception:
+                pass
+            
+            await asyncio.sleep(0.5)
         
-        self._send_move_command("HBW", target_x, target_y)
-        await asyncio.sleep(3)
-        
-        # State: RETRIEVING
-        self.state = ControllerState.RETRIEVING
-        print(f"[Controller] State: RETRIEVING")
-        
-        self._send_gripper_command("HBW", "close")
-        await asyncio.sleep(0.5)
-        
-        # State: MOVING_TO_DROPOFF
-        self.state = ControllerState.MOVING_TO_DROPOFF
-        print(f"[Controller] State: MOVING_TO_DROPOFF")
-        
-        self._send_move_command("HBW", 375, 375)
-        await asyncio.sleep(3)
-        
-        # Release
-        self._send_gripper_command("HBW", "open")
-        await asyncio.sleep(0.5)
-        
-        # Return to idle
-        self.state = ControllerState.IDLE
-        print(f"[Controller] RETRIEVE complete for {cmd.slot_name}")
-        
-        await self._log_command_completion(cmd)
+        print(f"[Controller] Timeout waiting for {device_id} to be IDLE")
+        return False
     
-    async def _log_command_completion(self, cmd: Command):
-        """Log command completion to API"""
-        if not self.http_client:
-            return
+    # =========================================================================
+    # Command Queue Polling
+    # =========================================================================
+    
+    async def _poll_pending_commands(self) -> Optional[QueuedCommand]:
+        """
+        Poll the database for the oldest PENDING command.
         
+        Returns
+        -------
+        Optional[QueuedCommand]
+            The next command to execute, or None if queue is empty.
+        """
+        try:
+            # Query API for pending commands
+            response = await self.http_client.get(
+                f"{API_URL}/commands/pending",
+                params={"limit": 1}
+            )
+            
+            if response.status_code == 200:
+                commands = response.json()
+                if commands and len(commands) > 0:
+                    cmd = commands[0]
+                    return QueuedCommand(
+                        id=cmd["id"],
+                        command_type=cmd["command_type"],
+                        target_slot=cmd.get("target_slot"),
+                        payload=json.loads(cmd.get("payload_json", "{}")),
+                        status=cmd["status"],
+                        created_at=datetime.fromisoformat(cmd["created_at"].replace("Z", "+00:00")),
+                    )
+            elif response.status_code == 404:
+                # Endpoint doesn't exist yet - use dashboard data
+                pass
+                
+        except Exception as e:
+            print(f"[Controller] Error polling commands: {e}")
+        
+        return None
+    
+    async def _update_command_status(self, command_id: int, status: str, message: str = ""):
+        """Update command status in the database."""
         try:
             await self.http_client.post(
-                f"{API_URL}/system/log",
-                params={
-                    "level": "INFO",
-                    "source": "CONTROLLER",
-                    "message": f"Completed {cmd.command_type} for {cmd.slot_name}",
+                f"{API_URL}/commands/{command_id}/status",
+                json={"status": status, "message": message}
+            )
+        except Exception as e:
+            print(f"[Controller] Error updating command status: {e}")
+    
+    # =========================================================================
+    # Command Execution - Process Order
+    # =========================================================================
+    
+    async def _execute_process_command(self, cmd: QueuedCommand):
+        """
+        Execute a PROCESS command (RAW_DOUGH -> BAKED).
+        
+        Workflow:
+        1. Move HBW to source slot
+        2. Pick up cookie
+        3. Move to conveyor
+        4. Place on conveyor
+        5. Start conveyor (simulates oven)
+        6. Wait for baking
+        7. Pick from conveyor
+        8. Return to slot
+        """
+        slot_name = cmd.target_slot
+        if not slot_name or slot_name not in SLOT_COORDINATES:
+            print(f"[Controller] Invalid slot: {slot_name}")
+            return False
+        
+        target_x, target_y = SLOT_COORDINATES[slot_name]
+        self.command_start_time = time.time()
+        
+        try:
+            # Step 1: Move to slot
+            self.state = ControllerState.MOVING_TO_SLOT
+            print(f"[Controller] Step 1: Moving to slot {slot_name}")
+            await self._send_move_command("HBW", target_x, target_y)
+            await asyncio.sleep(2.0)  # Simulated movement time
+            await self._wait_for_idle("HBW", timeout=10)
+            
+            # Step 2: Pick up cookie
+            self.state = ControllerState.PICKING
+            print(f"[Controller] Step 2: Picking cookie from {slot_name}")
+            await self._send_gripper_command("HBW", "extend")
+            await asyncio.sleep(0.5)
+            await self._send_gripper_command("HBW", "close")
+            await asyncio.sleep(0.5)
+            await self._send_gripper_command("HBW", "retract")
+            await asyncio.sleep(0.5)
+            
+            # Step 3: Move to conveyor
+            self.state = ControllerState.MOVING_TO_CONVEYOR
+            print(f"[Controller] Step 3: Moving to conveyor")
+            conv_x, conv_y = ZONES["CONVEYOR"]
+            await self._send_move_command("HBW", conv_x, conv_y)
+            await asyncio.sleep(2.0)
+            await self._wait_for_idle("HBW", timeout=10)
+            
+            # Step 4: Place on conveyor
+            self.state = ControllerState.PLACING
+            print(f"[Controller] Step 4: Placing on conveyor")
+            await self._send_gripper_command("HBW", "extend")
+            await asyncio.sleep(0.5)
+            await self._send_gripper_command("HBW", "open")
+            await asyncio.sleep(0.5)
+            await self._send_gripper_command("HBW", "retract")
+            await asyncio.sleep(0.5)
+            
+            # Step 5: Start conveyor (oven simulation)
+            self.state = ControllerState.WAITING_OVEN
+            print(f"[Controller] Step 5: Starting oven cycle")
+            await self._send_conveyor_command("start")
+            await asyncio.sleep(3.0)  # Simulated baking time
+            await self._send_conveyor_command("stop")
+            
+            # Step 6: Pick from conveyor
+            print(f"[Controller] Step 6: Picking baked cookie")
+            await self._send_gripper_command("HBW", "extend")
+            await asyncio.sleep(0.5)
+            await self._send_gripper_command("HBW", "close")
+            await asyncio.sleep(0.5)
+            await self._send_gripper_command("HBW", "retract")
+            await asyncio.sleep(0.5)
+            
+            # Step 7: Return to slot
+            self.state = ControllerState.RETURNING
+            print(f"[Controller] Step 7: Returning to slot {slot_name}")
+            await self._send_move_command("HBW", target_x, target_y)
+            await asyncio.sleep(2.0)
+            await self._wait_for_idle("HBW", timeout=10)
+            
+            # Step 8: Place cookie
+            print(f"[Controller] Step 8: Placing baked cookie")
+            await self._send_gripper_command("HBW", "extend")
+            await asyncio.sleep(0.5)
+            await self._send_gripper_command("HBW", "open")
+            await asyncio.sleep(0.5)
+            await self._send_gripper_command("HBW", "retract")
+            await asyncio.sleep(0.5)
+            
+            # Log energy consumption
+            elapsed_time = time.time() - self.command_start_time
+            energy_joules = 24.0 * 1.5 * elapsed_time  # V * A * s
+            await self._log_energy(energy_joules, elapsed_time)
+            
+            print(f"[Controller] PROCESS complete for {slot_name} ({elapsed_time:.1f}s, {energy_joules:.1f}J)")
+            return True
+            
+        except Exception as e:
+            print(f"[Controller] Error executing PROCESS: {e}")
+            return False
+    
+    async def _execute_store_command(self, cmd: QueuedCommand):
+        """Execute a STORE command."""
+        slot_name = cmd.target_slot
+        if not slot_name or slot_name not in SLOT_COORDINATES:
+            print(f"[Controller] Invalid slot: {slot_name}")
+            return False
+        
+        target_x, target_y = SLOT_COORDINATES[slot_name]
+        self.command_start_time = time.time()
+        
+        try:
+            # Move to pickup
+            print(f"[Controller] STORE: Moving to pickup zone")
+            pickup_x, pickup_y = ZONES["PICKUP"]
+            await self._send_move_command("HBW", pickup_x, pickup_y)
+            await asyncio.sleep(1.5)
+            
+            # Pick
+            await self._send_gripper_command("HBW", "close")
+            await asyncio.sleep(0.5)
+            
+            # Move to slot
+            print(f"[Controller] STORE: Moving to slot {slot_name}")
+            await self._send_move_command("HBW", target_x, target_y)
+            await asyncio.sleep(2.0)
+            
+            # Place
+            await self._send_gripper_command("HBW", "open")
+            await asyncio.sleep(0.5)
+            
+            elapsed_time = time.time() - self.command_start_time
+            energy_joules = 24.0 * 1.2 * elapsed_time
+            await self._log_energy(energy_joules, elapsed_time)
+            
+            print(f"[Controller] STORE complete for {slot_name}")
+            return True
+            
+        except Exception as e:
+            print(f"[Controller] Error executing STORE: {e}")
+            return False
+    
+    async def _execute_retrieve_command(self, cmd: QueuedCommand):
+        """Execute a RETRIEVE command."""
+        slot_name = cmd.target_slot
+        if not slot_name or slot_name not in SLOT_COORDINATES:
+            print(f"[Controller] Invalid slot: {slot_name}")
+            return False
+        
+        target_x, target_y = SLOT_COORDINATES[slot_name]
+        self.command_start_time = time.time()
+        
+        try:
+            # Move to slot
+            print(f"[Controller] RETRIEVE: Moving to slot {slot_name}")
+            await self._send_move_command("HBW", target_x, target_y)
+            await asyncio.sleep(2.0)
+            
+            # Pick
+            await self._send_gripper_command("HBW", "close")
+            await asyncio.sleep(0.5)
+            
+            # Move to dropoff
+            print(f"[Controller] RETRIEVE: Moving to dropoff zone")
+            await self._send_move_command("HBW", 375, 375)
+            await asyncio.sleep(2.0)
+            
+            # Release
+            await self._send_gripper_command("HBW", "open")
+            await asyncio.sleep(0.5)
+            
+            elapsed_time = time.time() - self.command_start_time
+            energy_joules = 24.0 * 1.2 * elapsed_time
+            await self._log_energy(energy_joules, elapsed_time)
+            
+            print(f"[Controller] RETRIEVE complete for {slot_name}")
+            return True
+            
+        except Exception as e:
+            print(f"[Controller] Error executing RETRIEVE: {e}")
+            return False
+    
+    async def _log_energy(self, joules: float, duration_sec: float):
+        """Log energy consumption to API."""
+        try:
+            await self.http_client.post(
+                f"{API_URL}/energy",
+                json={
+                    "device_id": "HBW",
+                    "joules": joules,
+                    "voltage": 24.0,
+                    "current_amps": joules / (24.0 * duration_sec) if duration_sec > 0 else 0,
+                    "power_watts": joules / duration_sec if duration_sec > 0 else 0,
                 }
             )
         except Exception as e:
-            print(f"[Controller] API log error: {e}")
+            print(f"[Controller] Energy log error: {e}")
     
-    async def _process_command_queue(self):
-        """Process commands from the queue"""
-        if self.state != ControllerState.IDLE:
-            return
-        
-        if self.emergency_stop_active:
-            return
-        
-        if not self.command_queue:
-            return
-        
-        cmd = self.command_queue.pop(0)
-        self.current_command = cmd
-        
-        if cmd.command_type == "STORE":
-            await self._execute_store_command(cmd)
-        elif cmd.command_type == "RETRIEVE":
-            await self._execute_retrieve_command(cmd)
-        
-        self.current_command = None
-    
-    async def _sync_with_api(self):
-        """Sync controller state with API"""
-        if not self.http_client:
-            return
-        
-        try:
-            # Get pending commands from API
-            response = await self.http_client.get(f"{API_URL}/dashboard/data")
-            if response.status_code == 200:
-                data = response.json()
-                # Update hardware positions from API
-                for hw in data.get("hardware", []):
-                    self.hardware_positions[hw["device_id"]] = HardwarePosition(
-                        device_id=hw["device_id"],
-                        x=hw["current_x"],
-                        y=hw["current_y"],
-                        z=hw["current_z"],
-                        status=hw["status"],
-                    )
-        except Exception as e:
-            print(f"[Controller] API sync error: {e}")
+    # =========================================================================
+    # Main Control Loop
+    # =========================================================================
     
     async def run(self):
-        """Main controller loop"""
+        """
+        Main controller loop implementing the Command Queue pattern.
+        
+        Loop Steps:
+        1. Poll for PENDING commands
+        2. Execute command (if found)
+        3. Update command status
+        4. Repeat
+        """
         self.running = True
         self.setup_mqtt()
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             self.http_client = client
             
-            print("[Controller] Starting main loop")
-            print(f"[Controller] API URL: {API_URL}")
+            print("=" * 60)
+            print("STF Digital Twin - Command Queue Controller")
+            print("=" * 60)
+            print(f"API URL: {API_URL}")
+            print(f"Poll Interval: {POLL_INTERVAL}s")
+            print("=" * 60)
             
             while self.running:
                 try:
-                    # Sync with API
-                    await self._sync_with_api()
+                    if self.emergency_stop_active:
+                        print("[Controller] Emergency stop active - waiting for reset")
+                        await asyncio.sleep(5.0)
+                        continue
                     
-                    # Process command queue
-                    await self._process_command_queue()
+                    # Poll for pending commands
+                    self.state = ControllerState.POLLING
+                    cmd = await self._poll_pending_commands()
                     
-                    # Status update
-                    if self.state != ControllerState.IDLE:
-                        print(f"[Controller] Current state: {self.state.name}")
+                    if cmd:
+                        print(f"\n[Controller] Processing command #{cmd.id}: {cmd.command_type}")
+                        self.current_command = cmd
+                        self.state = ControllerState.EXECUTING
+                        
+                        # Update status to IN_PROGRESS
+                        await self._update_command_status(cmd.id, "IN_PROGRESS")
+                        
+                        # Execute based on command type
+                        success = False
+                        if cmd.command_type == "PROCESS":
+                            success = await self._execute_process_command(cmd)
+                        elif cmd.command_type == "STORE":
+                            success = await self._execute_store_command(cmd)
+                        elif cmd.command_type == "RETRIEVE":
+                            success = await self._execute_retrieve_command(cmd)
+                        else:
+                            print(f"[Controller] Unknown command type: {cmd.command_type}")
+                        
+                        # Update final status
+                        final_status = "COMPLETED" if success else "FAILED"
+                        await self._update_command_status(cmd.id, final_status)
+                        
+                        self.current_command = None
                     
-                    await asyncio.sleep(0.5)
+                    # Return to idle
+                    self.state = ControllerState.IDLE
+                    await asyncio.sleep(POLL_INTERVAL)
                     
                 except Exception as e:
                     print(f"[Controller] Error in main loop: {e}")
                     self.state = ControllerState.ERROR
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2.0)
         
         # Cleanup
         if self.mqtt_client:
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
+        
+        print("[Controller] Shutdown complete")
     
     def stop(self):
-        """Stop the controller"""
+        """Stop the controller gracefully."""
         self.running = False
 
 
 async def main():
-    """Run the main controller"""
-    print("=" * 60)
-    print("STF Digital Twin - Main Controller")
-    print("=" * 60)
-    print(f"API URL: {API_URL}")
-    print(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
-    print("=" * 60)
-    
+    """Entry point for the controller."""
     controller = MainController()
     
     try:
         await controller.run()
     except KeyboardInterrupt:
-        print("\nShutting down controller...")
+        print("\n[Controller] Interrupted by user")
         controller.stop()
 
 

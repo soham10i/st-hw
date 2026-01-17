@@ -213,7 +213,8 @@ class RetrieveRequest(BaseModel):
     slot_name: str
 
 class ProcessOrderRequest(BaseModel):
-    source_slot: str
+    source_slot: Optional[str] = None  # Auto-selects first RAW_DOUGH slot if not provided
+    flavor: Optional[str] = None  # Optional flavor filter for auto-selection
 
 class CommandResponse(BaseModel):
     success: bool
@@ -801,12 +802,55 @@ async def retrieve_cookie(data: RetrieveRequest, db: Session = Depends(get_db)):
 
 @app.post("/order/process", response_model=CommandResponse, tags=["Orders"])
 async def process_cookie(data: ProcessOrderRequest, db: Session = Depends(get_db)):
-    """Process a RAW_DOUGH cookie: Storage → Oven → Conveyor → BAKED"""
-    slot = db.query(InventorySlot).filter(InventorySlot.slot_name == data.source_slot).first()
-    if not slot:
-        raise HTTPException(status_code=404, detail=f"Slot {data.source_slot} not found")
-    if not slot.carrier_id:
-        raise HTTPException(status_code=400, detail=f"Slot {data.source_slot} is empty")
+    """
+    Process a RAW_DOUGH cookie: Storage -> Oven -> Conveyor -> BAKED.
+    
+    If source_slot is not provided, automatically selects the first available
+    slot containing a RAW_DOUGH cookie. Optionally filters by flavor.
+    
+    Parameters
+    ----------
+    data : ProcessOrderRequest
+        source_slot : Optional slot name (e.g., 'A1'). If None, auto-selects.
+        flavor : Optional flavor filter for auto-selection (e.g., 'CHOCO').
+    
+    Returns
+    -------
+    CommandResponse
+        Success status, command ID, slot name, and batch UUID.
+    """
+    # Auto-select slot if not provided
+    if data.source_slot:
+        slot = db.query(InventorySlot).filter(InventorySlot.slot_name == data.source_slot).first()
+        if not slot:
+            raise HTTPException(status_code=404, detail=f"Slot {data.source_slot} not found")
+        if not slot.carrier_id:
+            raise HTTPException(status_code=400, detail=f"Slot {data.source_slot} is empty")
+    else:
+        # Auto-select: Find first slot with RAW_DOUGH cookie
+        slots = db.query(InventorySlot).filter(InventorySlot.carrier_id != None).all()
+        slot = None
+        for s in slots:
+            carrier = db.query(Carrier).filter(Carrier.id == s.carrier_id).first()
+            if carrier:
+                cookie = db.query(Cookie).filter(
+                    Cookie.carrier_id == carrier.id,
+                    Cookie.status == CookieStatus.RAW_DOUGH
+                ).first()
+                if cookie:
+                    # Optional flavor filter
+                    if data.flavor:
+                        try:
+                            target_flavor = CookieFlavor[data.flavor.upper()]
+                            if cookie.flavor != target_flavor:
+                                continue
+                        except KeyError:
+                            pass
+                    slot = s
+                    break
+        
+        if not slot:
+            raise HTTPException(status_code=400, detail="No RAW_DOUGH cookies available for processing")
     
     carrier = db.query(Carrier).filter(Carrier.id == slot.carrier_id).first()
     cookie = db.query(Cookie).filter(Cookie.carrier_id == carrier.id).first() if carrier else None
@@ -821,26 +865,26 @@ async def process_cookie(data: ProcessOrderRequest, db: Session = Depends(get_db
     batch_uuid = cookie.batch_uuid
     
     command = Command(
-        command_type="PROCESS", target_slot=data.source_slot,
+        command_type="PROCESS", target_slot=slot.slot_name,
         payload_json=json.dumps({"batch_uuid": batch_uuid, "new_status": "BAKED"}),
-        status="COMPLETED", executed_at=datetime.utcnow(), completed_at=datetime.utcnow(),
+        status="PENDING",  # Queue for controller to process
     )
     db.add(command)
     
     log = SystemLog(level=LogLevel.INFO, source="API", 
-                   message=f"Processed cookie {batch_uuid[:8]}... from RAW_DOUGH to BAKED")
+                   message=f"Queued process command for {slot.slot_name} (cookie {batch_uuid[:8]}...)")
     db.add(log)
     db.commit()
     
     # Broadcast inventory update
     await broadcast_state_update(db, "inventory_update", {
-        "slot_name": data.source_slot,
+        "slot_name": slot.slot_name,
         "action": "process",
         "cookie_status": "BAKED",
     })
     
-    return CommandResponse(success=True, message=f"Cookie processed to BAKED",
-                          command_id=command.id, slot_name=data.source_slot, batch_uuid=batch_uuid)
+    return CommandResponse(success=True, message=f"Cookie from {slot.slot_name} queued for processing",
+                          command_id=command.id, slot_name=slot.slot_name, batch_uuid=batch_uuid)
 
 # ============================================================================
 # Dashboard Endpoint

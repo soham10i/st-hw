@@ -1,114 +1,88 @@
-# STF Digital Twin
+# STF Digital Twin v3.0
 
-A **High-Fidelity Component Twin** for warehouse automation featuring electrical simulation, mechanical wear modeling, WebSocket real-time updates, and an Industrial Apple Glassmorphism dashboard.
+A **High-Fidelity Component Twin** for warehouse automation featuring a Command Queue architecture, electrical simulation, mechanical wear modeling, synthetic data generation, and an advanced analytics dashboard.
 
 ## Overview
 
-The Smart Tabletop Factory (STF) Digital Twin simulates a high-bay warehouse automation system with hardware-in-the-loop capabilities. It provides real-time monitoring, control, predictive maintenance, and analytics for industrial automation scenarios.
+The Smart Tabletop Factory (STF) Digital Twin simulates a high-bay warehouse automation system with hardware-in-the-loop capabilities. It provides real-time monitoring, control, predictive maintenance, and analytics for industrial automation scenarios. This version introduces a robust Command Queue architecture for reliable, sequential execution of complex tasks.
 
 ## Architecture
 
+The system is built on a decoupled, event-driven architecture:
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                     STF Digital Twin v3.0                               │
+│                     STF Digital Twin v3.0 - Command Queue Architecture    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐          │
-│  │  Streamlit   │    │     FastAPI      │    │    MySQL     │          │
-│  │  Dashboard   │◄──►│  REST + WebSocket │◄──►│   Database   │          │
+│  │  Streamlit   │───►│     FastAPI      │───►│    MySQL     │          │
+│  │  Dashboard   │    │  (Queue Command) │    │  (Commands)  │          │
 │  │  (Port 8501) │    │   (Port 8000)    │    │  (Port 3306) │          │
-│  └──────────────┘    └──────────────────┘    └──────────────┘          │
-│         │                    │                                          │
-│         ▼                    ▼                                          │
+│  └──────────────┘    └──────────────────┘    └──────▲───────┘          │
+│                                                     │ (Polls)           │
+│                                                     │                   │
+│  ┌──────────────────────────────────────────────────┴─────────────────┐  │
+│  │              Main Controller (Command Queue Processor)             │  │
+│  │  • Polls DB for PENDING commands                                  │  │
+│  │  • Executes commands sequentially (FSM logic)                     │  │
+│  │  • Updates command status (IN_PROGRESS -> COMPLETED/FAILED)       │  │
+│  └──────────────────────────────────┬─────────────────────────────────┘  │
+│                                     │ (Publishes)                       │
+│                                     ▼                                   │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │                    MQTT Broker (Port 1883)                        │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
-│         │                    │                    │                     │
+│         │ (Subscribes)         │                    │                     │
 │         ▼                    ▼                    ▼                     │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐             │
 │  │   Mock HBW   │    │   Mock VGR   │    │  Conveyor    │             │
 │  │  (10Hz sim)  │    │  (10Hz sim)  │    │  (10Hz sim)  │             │
-│  │  • 4 Motors  │    │  • 5 Motors  │    │  • 5 Motors  │             │
-│  │  • Health    │    │  • Vacuum    │    │  • 4 Sensors │             │
 │  └──────────────┘    └──────────────┘    └──────────────┘             │
-│                                                                         │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │              Main Controller (FSM Logic)                          │  │
-│  │  • Command translation  • Safety interlocks                       │  │
-│  │  • Collision prevention • Energy logging                          │  │
-│  │  • Predictive maintenance alerts                                  │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Key Features
 
-### High-Fidelity Component Twin
+### Command Queue Architecture
+- **Reliable Execution**: API endpoints queue commands in the database with `PENDING` status.
+- **Decoupled Controller**: The `main_controller` polls the database for pending commands, ensuring sequential and non-blocking execution.
+- **State Management**: Commands are updated to `IN_PROGRESS`, `COMPLETED`, or `FAILED`, providing a full audit trail.
+- **Auto-Slot Selection**: The `/order/process` endpoint can now automatically select a `RAW_DOUGH` cookie if no `source_slot` is specified.
 
-- **14 Component Registry**: HBW (4), CONVEYOR (5), VGR (5) with spec sheets
-- **Electrical Simulation**: Idle (0.05A), Startup inrush (2.5A), Running (1.2A)
-- **Health Degradation**: Motors degrade 0.0001 per tick when active
-- **Predictive Maintenance**: Time-to-Failure (TTF) estimation
-- **Anomaly Injection**: Current spikes when health_score < 0.8
+### Synthetic Data Generation
+- **1-Month Historical Data**: The `scripts/generate_history.py` script populates the database with 30 days of realistic data.
+- **Breakdown Scenarios**:
+  - **Day 12: Motor Failure**: `CONV_M1` current spikes to 4.5A and health degrades to 40%.
+  - **Day 25: Sensor Drift**: `CONV_L2_PROCESS` generates intermittent ghost readings.
+- **Rich Data**: Includes order events, energy logs, motor health degradation, and predictive maintenance alerts.
 
-### Main Dashboard
-
-- **Industrial Apple Glassmorphism** design with frosted glass effects
-- **Conveyor Belt Progress Bar** with 4 light barrier sensor indicators
-- **Motor Health Cards** with health bars and TTF badges
-- **Live Power Gauge** showing total current draw vs. spec limits
-- **Live 2D Robot Position** monitoring with scatter plot
-- **3x3 Inventory Grid** with cookie status (RAW_DOUGH → BAKED → PACKAGED)
-- **Control Panel** for store/retrieve/bake operations
-- **Real-time WebSocket** updates (1 second refresh)
-
-### Analytics Page
-
-- **Energy Consumption** time-series charts by device
-- **Production Throughput** visualization with daily/weekly trends
-- **Hardware Utilization** heatmaps showing activity patterns
-- **Predictive Maintenance** insights with health scores
-- **Anomaly Detection** visualization
-- **Data Export** functionality (CSV format)
-- **Date Range Filtering** (24h, 7d, 30d, 90d, custom)
-
-### Simulation Engine
-
-- **AsyncIO-based Physics** at 10Hz tick rate
-- **Conveyor Belt Physics**: 0-1000mm position tracking
-- **Light Barrier Sensors**: L1 (100mm), L2 (400mm), L3 (700mm), L4 (950mm)
-- **Motor Electrical Model**: Phase-based current simulation
-- **Micro-stoppages**: Random pauses when health_score < 0.5
-- **MQTT Communication** for hardware commands/telemetry
+### Enhanced Analytics Dashboard
+- **Real Database Integration**: Charts now pull historical data directly from the database.
+- **Breakdown Visualization**: Key charts now highlight the Day 12 motor failure and Day 25 sensor drift events.
+- **Motor Health View**: A dedicated tab for tracking motor health degradation over time and viewing current status.
+- **Alerts & Events**: A new tab to display critical, warning, and info alerts with timestamps.
+- **Predictive Insights**: Health forecast chart and maintenance recommendations based on current health scores.
 
 ## Quick Start
 
 ### Prerequisites
-
 - Python 3.9+ (3.11 recommended)
 - MySQL 8.0+ (or Docker)
 
 ### Installation
-
 ```bash
-# Clone repository
 git clone <repository-url> stf_project
 cd stf_project
-
-# Create virtual environment
 python -m venv venv
 source venv/bin/activate  # Linux/macOS
-.\venv\Scripts\activate   # Windows
-
-# Install dependencies
+# .\venv\Scripts\activate   # Windows
 pip install -r requirements.txt
 ```
 
 ### Configuration
-
 Create a `.env` file in the project root:
-
 ```env
 DATABASE_URL=mysql+pymysql://stf_user:stf_password@localhost:3306/stf_warehouse
 STF_API_URL=http://localhost:8000
@@ -117,27 +91,24 @@ MQTT_BROKER=localhost
 MQTT_PORT=1883
 ```
 
+### Generate Historical Data
+Run the synthetic data generator to populate the database:
+```bash
+python scripts/generate_history.py --days 30 --orders-per-day 50
+```
+
 ### Start Services
-
 **Option 1: Run script (Linux/macOS)**
-
 ```bash
 ./run_all.sh
 ```
 
-**Option 2: Run script (Windows)**
-
-```cmd
-run_all.bat
-```
-
-**Option 3: Manual startup (4 terminals)**
-
+**Option 2: Manual startup (4 terminals)**
 ```bash
 # Terminal 1 - FastAPI Server
-python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
-# Terminal 2 - Mock Hardware (High-Fidelity)
+# Terminal 2 - Mock Hardware
 python -m hardware.mock_factory
 
 # Terminal 3 - Main Controller
@@ -147,119 +118,41 @@ python -m controller.main_controller
 streamlit run dashboard/app.py
 ```
 
-**Option 4: Docker infrastructure**
-
-```bash
-docker-compose up -d  # Starts MySQL + Mosquitto + Adminer
-```
-
 ### Access Points
-
 | Service          | URL                             |
 | ---------------- | ------------------------------- |
 | Dashboard        | http://localhost:8501           |
 | Analytics        | http://localhost:8501/analytics |
 | API Docs         | http://localhost:8000/docs      |
-| WebSocket        | ws://localhost:8000/ws          |
-| Adminer (Docker) | http://localhost:8080           |
 
 ## Project Structure
-
 ```
 stf_project/
 ├── api/                    # FastAPI REST API + WebSocket
-│   └── main.py            # API endpoints & WS manager
-├── controller/            # Main controller
-│   └── main_controller.py # FSM logic & safety
-├── dashboard/             # Streamlit UI
-│   ├── app.py            # Main dashboard (Glassmorphism)
+├── controller/             # Command Queue controller
+├── dashboard/              # Streamlit UI
+│   ├── app.py            # Main dashboard
 │   └── pages/
-│       └── analytics.py  # Historical analytics
-├── database/             # SQLAlchemy models
-│   ├── models.py        # ORM models (14 tables)
-│   └── connection.py    # DB connection
-├── hardware/             # Mock hardware
-│   ├── mock_factory.py  # High-fidelity simulation
-│   └── mock_hbw.py      # Legacy HBW simulation
-├── docs/                 # Documentation
-│   ├── SETUP.md         # Detailed setup guide
-│   └── HARDWARE_BRIDGE.md # Node-RED/RevPi integration
-├── mosquitto/           # MQTT broker config
-├── docker-compose.yml   # Docker services
-├── requirements.txt     # Python dependencies
-├── run_all.sh          # Linux/macOS startup
-└── run_all.bat         # Windows startup
+│       └── analytics.py  # Enhanced historical analytics
+├── database/               # SQLAlchemy models
+├── hardware/               # Mock hardware simulation
+├── scripts/                # Data generation scripts
+│   └── generate_history.py # Synthetic data generator
+├── docs/                   # Documentation
+├── mosquitto/              # MQTT broker config
+├── docker-compose.yml      # Docker services
+├── requirements.txt        # Python dependencies
+└── run_all.sh              # Startup script
 ```
 
-## API Endpoints
+## API Endpoints (Updated)
+| Endpoint                        | Method | Description                                    |
+| ------------------------------- | ------ | ---------------------------------------------- |
+| `/commands/pending`             | GET    | Get pending commands for the controller        |
+| `/commands/{id}/status`         | POST   | Update the status of a command                 |
+| `/order/process`                | POST   | Queue a process command (auto-slot supported)  |
 
-| Endpoint                        | Method | Description              |
-| ------------------------------- | ------ | ------------------------ |
-| `/health`                       | GET    | Health check             |
-| `/ws`                           | WS     | WebSocket real-time      |
-| `/dashboard/data`               | GET    | All dashboard data       |
-| `/inventory`                    | GET    | List inventory slots     |
-| `/components/specs`             | GET    | Component specifications |
-| `/hardware/states`              | GET    | All hardware states      |
-| `/hardware/state`               | POST   | Update hardware state    |
-| `/motors/state`                 | POST   | Update motor state       |
-| `/sensors/state`                | POST   | Update sensor state      |
-| `/conveyor/state`               | POST   | Update conveyor state    |
-| `/order/store`                  | POST   | Store a cookie           |
-| `/order/retrieve`               | POST   | Retrieve a cookie        |
-| `/order/process`                | POST   | Bake a cookie            |
-| `/telemetry`                    | POST   | Record telemetry         |
-| `/energy`                       | POST   | Record energy usage      |
-| `/maintenance/initialize`       | POST   | Initialize system        |
-| `/maintenance/reset`            | POST   | Reset system             |
-| `/maintenance/emergency-stop`   | POST   | Emergency stop           |
-
-## Database Schema
-
-| Table                    | Description                |
-| ------------------------ | -------------------------- |
-| `py_carriers`            | Carrier entities           |
-| `py_cookies`             | Cookie batches (lifecycle) |
-| `py_inventory_slots`     | 3x3 rack grid              |
-| `py_hardware_states`     | Device positions           |
-| `py_component_registry`  | Component specifications   |
-| `py_motor_states`        | Motor health & current     |
-| `py_sensor_states`       | Sensor trigger states      |
-| `py_system_logs`         | System logs                |
-| `py_energy_logs`         | Energy consumption         |
-| `py_telemetry_history`   | Time-series data           |
-| `py_alerts`              | System alerts              |
-| `py_commands`            | Command history            |
-
-## Cookie Lifecycle
-
-```
-RAW_DOUGH → BAKED → PACKAGED → SHIPPED
-    │          │         │
-    └──────────┴─────────┴── Tracked in inventory
-```
-
-## Component Registry
-
-| Subsystem | Components                                    |
-| --------- | --------------------------------------------- |
-| HBW       | HBW_X_MOTOR, HBW_Y_MOTOR, HBW_Z_MOTOR, HBW_GRIPPER |
-| CONVEYOR  | CONV_M1, CONV_L1, CONV_L2, CONV_L3, CONV_L4  |
-| VGR       | VGR_X_MOTOR, VGR_Y_MOTOR, VGR_Z_MOTOR, VGR_COMP, VGR_VALVE |
-
-## Safety Features
-
-- **Collision Prevention**: Blocks movements that would cause hardware collision
-- **Emergency Stop**: Immediately halts all hardware operations
-- **Health Monitoring**: Alerts when motor health < 0.5
-- **Micro-stoppage Detection**: Logs when degraded motors pause
-- **Alert System**: Logs critical events with severity levels
-- **FSM Logic**: Ensures proper state transitions
-
-## Documentation
-
-- **[docs/SETUP.md](docs/SETUP.md)** - Windows, macOS, Linux installation
-- **[docs/HARDWARE_BRIDGE.md](docs/HARDWARE_BRIDGE.md)** - Node-RED & RevPi integration
+(Other endpoints remain the same)
 
 ## License
 
