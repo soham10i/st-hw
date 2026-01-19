@@ -252,21 +252,27 @@ button, input, select, textarea, .stButton, .stSelectbox, .stTextInput {
 .slot-card {
     background: rgba(255, 255, 255, 0.03);
     backdrop-filter: blur(15px);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 2px solid rgba(255, 255, 255, 0.12);
     border-radius: 16px;
     padding: 16px;
     text-align: center;
-    min-height: 100px;
+    min-height: 110px;
+    max-height: 130px;
     display: flex;
     flex-direction: column;
     justify-content: center;
     align-items: center;
     transition: all 0.3s ease;
+    margin: 4px;
+    box-sizing: border-box;
+    overflow: hidden;
 }
 
 .slot-card:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.08);
     transform: scale(1.02);
+    border-color: rgba(255, 255, 255, 0.25);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
 }
 
 .slot-name {
@@ -276,40 +282,113 @@ button, input, select, textarea, .stButton, .stSelectbox, .stTextInput {
     margin-bottom: 8px;
 }
 
-.slot-empty { border-color: rgba(255, 255, 255, 0.05); }
-.slot-choco { border-color: rgba(139, 90, 43, 0.5); box-shadow: inset 0 0 30px rgba(139, 90, 43, 0.2); }
-.slot-vanilla { border-color: rgba(255, 235, 180, 0.5); box-shadow: inset 0 0 30px rgba(255, 235, 180, 0.2); }
-.slot-strawberry { border-color: rgba(255, 105, 180, 0.5); box-shadow: inset 0 0 30px rgba(255, 105, 180, 0.2); }
+.slot-empty { 
+    border-color: rgba(255, 255, 255, 0.08); 
+    border-style: dashed;
+}
+.slot-choco { 
+    border-color: rgba(139, 90, 43, 0.7); 
+    box-shadow: inset 0 0 30px rgba(139, 90, 43, 0.25), 0 0 10px rgba(139, 90, 43, 0.2); 
+}
+.slot-vanilla { 
+    border-color: rgba(255, 235, 180, 0.7); 
+    box-shadow: inset 0 0 30px rgba(255, 235, 180, 0.25), 0 0 10px rgba(255, 235, 180, 0.2); 
+}
+.slot-strawberry { 
+    border-color: rgba(255, 105, 180, 0.7); 
+    box-shadow: inset 0 0 30px rgba(255, 105, 180, 0.25), 0 0 10px rgba(255, 105, 180, 0.2); 
+}
 
 .cookie-indicator {
-    width: 40px;
-    height: 40px;
+    width: 42px;
+    height: 42px;
     border-radius: 50%;
     margin-top: 8px;
-    box-shadow: 0 0 15px rgba(0,0,0,0.3);
+    box-shadow: 0 4px 15px rgba(0,0,0,0.4);
+    border: 2px solid rgba(255, 255, 255, 0.15);
+    transition: all 0.3s ease;
+}
+
+.cookie-indicator:hover {
+    transform: scale(1.1);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.5);
 }
 
 /* RAW_DOUGH - Cream/beige dough color for all flavors */
-.cookie-raw { background: radial-gradient(circle, #F5DEB3 0%, #DEB887 50%, #D2B48C 100%); box-shadow: 0 0 15px rgba(222, 184, 135, 0.5); }
-
-/* BAKED cookies - Flavor specific colors */
-.cookie-choco { background: radial-gradient(circle, #5D4037 0%, #3E2723 50%, #2C1810 100%); box-shadow: 0 0 15px rgba(93, 64, 55, 0.6); }
-.cookie-vanilla { background: radial-gradient(circle, #FFFEF0 0%, #FFF8E7 50%, #F5F5DC 100%); box-shadow: 0 0 15px rgba(255, 255, 240, 0.6); }
-.cookie-strawberry { background: radial-gradient(circle, #FF69B4 0%, #FF1493 50%, #DB7093 100%); box-shadow: 0 0 15px rgba(255, 105, 180, 0.6); }
-
-/* Cookie Status Badge */
-.cookie-status {
-    font-size: 9px;
-    padding: 2px 6px;
-    border-radius: 8px;
-    margin-top: 4px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+.cookie-raw { 
+    background: radial-gradient(circle at 30% 30%, #F5DEB3 0%, #DEB887 40%, #D2B48C 70%, #C4A57B 100%); 
+    box-shadow: 0 4px 15px rgba(222, 184, 135, 0.6), inset 0 -2px 4px rgba(0,0,0,0.1); 
+    border-color: rgba(210, 180, 140, 0.5);
 }
 
-.status-raw_dough { background: rgba(255, 193, 7, 0.2); color: #ffc107; }
-.status-baked { background: rgba(255, 152, 0, 0.2); color: #ff9800; }
-.status-packaged { background: rgba(76, 175, 80, 0.2); color: #4caf50; }
+/* BAKED cookies - Flavor specific colors with enhanced gradients */
+.cookie-choco { 
+    background: radial-gradient(circle at 30% 30%, #8D6E63 0%, #5D4037 30%, #3E2723 60%, #2C1810 100%); 
+    box-shadow: 0 4px 15px rgba(93, 64, 55, 0.7), inset 0 -2px 4px rgba(0,0,0,0.2); 
+    border-color: rgba(93, 64, 55, 0.6);
+}
+.cookie-vanilla { 
+    background: radial-gradient(circle at 30% 30%, #FFFFF5 0%, #FFFEF0 30%, #FFF8E7 60%, #F5F5DC 100%); 
+    box-shadow: 0 4px 15px rgba(255, 255, 240, 0.7), inset 0 -2px 4px rgba(0,0,0,0.05); 
+    border-color: rgba(245, 245, 220, 0.6);
+}
+.cookie-strawberry { 
+    background: radial-gradient(circle at 30% 30%, #FFB6C1 0%, #FF69B4 30%, #FF1493 60%, #DB7093 100%); 
+    box-shadow: 0 4px 15px rgba(255, 105, 180, 0.7), inset 0 -2px 4px rgba(0,0,0,0.1); 
+    border-color: rgba(255, 105, 180, 0.6);
+}
+
+/* Cookie Status Badge - Enhanced with better contrast */
+.cookie-status {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 10px;
+    margin-top: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border: 1px solid transparent;
+}
+
+/* RAW_DOUGH status - Yellow/amber for unprocessed */
+.status-raw_dough { 
+    background: rgba(255, 193, 7, 0.25); 
+    color: #ffc107; 
+    border-color: rgba(255, 193, 7, 0.4);
+    text-shadow: 0 0 8px rgba(255, 193, 7, 0.3);
+}
+
+/* BAKED status - Orange for processed/cooked */
+.status-baked { 
+    background: rgba(255, 152, 0, 0.25); 
+    color: #ff9800; 
+    border-color: rgba(255, 152, 0, 0.4);
+    text-shadow: 0 0 8px rgba(255, 152, 0, 0.3);
+}
+
+/* PACKAGED status - Green for ready/complete */
+.status-packaged { 
+    background: rgba(76, 175, 80, 0.25); 
+    color: #4caf50; 
+    border-color: rgba(76, 175, 80, 0.4);
+    text-shadow: 0 0 8px rgba(76, 175, 80, 0.3);
+}
+
+/* DELIVERED status - Blue for shipped */
+.status-delivered { 
+    background: rgba(33, 150, 243, 0.25); 
+    color: #2196f3; 
+    border-color: rgba(33, 150, 243, 0.4);
+    text-shadow: 0 0 8px rgba(33, 150, 243, 0.3);
+}
+
+/* ERROR status - Red for issues */
+.status-error { 
+    background: rgba(244, 67, 54, 0.25); 
+    color: #f44336; 
+    border-color: rgba(244, 67, 54, 0.4);
+    text-shadow: 0 0 8px rgba(244, 67, 54, 0.3);
+}
 
 /* Log Entry */
 .log-entry {
@@ -413,6 +492,37 @@ div[data-testid="stVerticalBlock"] > div {
     height: 20px;
     background: linear-gradient(180deg, #00ff88 0%, #00cc6a 100%);
     border-radius: 2px;
+}
+
+/* Fix layout overlapping */
+.stColumn > div {
+    padding: 0 8px;
+}
+
+.stColumn:first-child > div {
+    padding-left: 0;
+}
+
+.stColumn:last-child > div {
+    padding-right: 0;
+}
+
+/* Ensure proper spacing between rows */
+.row-widget.stHorizontalBlock {
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+/* Fix chart container overflow */
+.js-plotly-plot {
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* Prevent content overflow in cards */
+.glass-card, .kpi-card, .motor-card, .power-gauge {
+    overflow: hidden;
+    word-wrap: break-word;
 }
 
 /* TTF Badge */
@@ -804,6 +914,28 @@ if data:
                     hovertemplate=f"<b>{row['Device']}</b><br>X: {row['X']}<br>Y: {row['Y']}<br>Status: {row['Status']}<extra></extra>"
                 ))
             
+            # Add zones for conveyor, oven, and pickup
+            zones = [
+                {"name": "PICKUP", "x": 25, "y": 25, "color": "rgba(0, 255, 136, 0.1)"},
+                {"name": "CONVEYOR", "x": 350, "y": 200, "color": "rgba(255, 165, 2, 0.1)"},
+                {"name": "OVEN", "x": 350, "y": 100, "color": "rgba(255, 71, 87, 0.1)"},
+            ]
+            
+            for zone in zones:
+                fig.add_shape(
+                    type="rect",
+                    x0=zone["x"] - 30, y0=zone["y"] - 30,
+                    x1=zone["x"] + 30, y1=zone["y"] + 30,
+                    line=dict(color="rgba(255,255,255,0.2)", width=2, dash="dash"),
+                    fillcolor=zone["color"]
+                )
+                fig.add_annotation(
+                    x=zone["x"], y=zone["y"] - 45,
+                    text=zone["name"],
+                    showarrow=False,
+                    font=dict(color="rgba(255,255,255,0.5)", size=9)
+                )
+            
             fig.update_layout(
                 plot_bgcolor="rgba(0,0,0,0)",
                 paper_bgcolor="rgba(0,0,0,0)",
@@ -812,21 +944,43 @@ if data:
                     showgrid=True,
                     gridcolor="rgba(255,255,255,0.05)",
                     zeroline=False,
-                    color="rgba(255,255,255,0.5)"
+                    color="rgba(255,255,255,0.5)",
+                    title=dict(text="X Position (mm)", font=dict(size=10, color="rgba(255,255,255,0.4)")),
+                    tickfont=dict(size=9, color="rgba(255,255,255,0.4)"),
+                    dtick=100,
+                    fixedrange=False  # Allow zooming on X axis
                 ),
                 yaxis=dict(
                     range=[-20, 420],
                     showgrid=True,
                     gridcolor="rgba(255,255,255,0.05)",
                     zeroline=False,
-                    color="rgba(255,255,255,0.5)"
+                    color="rgba(255,255,255,0.5)",
+                    title=dict(text="Y Position (mm)", font=dict(size=10, color="rgba(255,255,255,0.4)")),
+                    tickfont=dict(size=9, color="rgba(255,255,255,0.4)"),
+                    dtick=100,
+                    fixedrange=False  # Allow zooming on Y axis
                 ),
                 showlegend=False,
-                margin=dict(l=40, r=40, t=20, b=40),
-                height=350
+                margin=dict(l=50, r=20, t=20, b=50),
+                height=350,
+                dragmode="pan",  # Enable pan mode for moving around
+                hovermode="closest"
             )
             
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            # Enable interactive features including zoom, pan, and selection
+            st.plotly_chart(
+                fig, 
+                use_container_width=True, 
+                config={
+                    "displayModeBar": True,
+                    "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"],
+                    "modeBarButtonsToAdd": ["drawopenpath", "eraseshape"],
+                    "displaylogo": False,
+                    "scrollZoom": True,  # Enable scroll to zoom
+                    "doubleClick": "reset",  # Double-click to reset view
+                }
+            )
         else:
             st.info("No hardware data available")
     
