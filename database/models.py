@@ -127,7 +127,7 @@ class Cookie(Base):
     __tablename__ = "py_cookies"
     batch_uuid = Column(String(36), primary_key=True)
     carrier_id = Column(Integer, ForeignKey("py_carriers.id"), nullable=True)
-    flavor = Column(Enum(CookieFlavor), nullable=False, default=CookieFlavor.CHOCO)
+    flavor = Column(Enum(CookieFlavor), nullable=True)
     status = Column(Enum(CookieStatus), nullable=False, default=CookieStatus.RAW_DOUGH)
     expiry_date = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

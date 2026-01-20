@@ -11,13 +11,17 @@ Kinematic Model:
     - 3-axis Cartesian robot (HBW) with X, Y, Z axes
     - Encoder motor: 75 pulses/rev, 4mm spindle pitch = 18.75 pulses/mm
     - Square path movement (no diagonal moves inside rack)
+
+MQTT Topics:
+    Subscribe: stf/{hbw,vgr,conveyor}/status, stf/global/emergency
+    Publish:   stf/{device}/cmd/{move,gripper,stop}, stf/conveyor/cmd/{belt,motor}
 """
 
 import asyncio
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from typing import Optional, Dict, List, Tuple
@@ -34,42 +38,55 @@ except ImportError:
 
 # Import kinematic constants from database models
 from database.models import (
-    SLOT_COORDINATES_3D, SLOT_COORDINATES_2D,
+    SLOT_COORDINATES_3D,
     REST_POS, CONVEYOR_POS,
     PULSES_PER_MM, Z_RETRACTED, Z_CARRY, Z_EXTENDED,
 )
 
-# Configuration
+
+# =============================================================================
+# CONFIGURATION CONSTANTS
+# =============================================================================
+
+# API and MQTT Configuration
 API_URL = os.environ.get("STF_API_URL", "http://localhost:8000")
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))  # seconds
 
-# Legacy coordinate mapping (for backward compatibility)
-SLOT_COORDINATES = SLOT_COORDINATES_2D
+# MQTT Topic Prefixes
+MQTT_TOPIC_PREFIX = "stf"
+MQTT_CMD_MOVE = "cmd/move"
+MQTT_CMD_GRIPPER = "cmd/gripper"
+MQTT_CMD_STOP = "cmd/stop"
+MQTT_CMD_BELT = "cmd/belt"
+MQTT_CMD_MOTOR = "cmd/motor"
 
-# Zone coordinates (legacy 2D)
-ZONES = {
-    "PICKUP": (25, 25),       # Cookie pickup zone
-    "CONVEYOR": (CONVEYOR_POS[0], CONVEYOR_POS[1]),  # Conveyor handoff zone
-    "OVEN": (350, 100),       # Oven zone
-    "HOME": (REST_POS[0], REST_POS[1]),  # Home position
-}
+# Hardware Devices
+DEVICE_HBW = "hbw"
+DEVICE_VGR = "vgr"
+DEVICE_CONVEYOR = "conveyor"
+
+# Timing Constants
+DEFAULT_MOVE_TIMEOUT_SEC = 30.0
+CONVEYOR_TIMEOUT_SEC = 5.0
+SENSOR_POLL_INTERVAL_SEC = 0.1  # 10Hz polling
+OVEN_CYCLE_DURATION_SEC = 3.0
+
+# Energy Calculation Constants
+MOTOR_VOLTAGE = 24.0  # Volts
+MOTOR_CURRENT_MOVE = 1.2  # Amps during movement
+MOTOR_CURRENT_PROCESS = 1.5  # Amps during processing
+
+# Conveyor Belt Constants (120mm belt - matches hardware/mock_factory.py)
+CONVEYOR_BELT_LENGTH_MM = 120.0
+CONVEYOR_HBW_INTERFACE_POS = (400, 100, 25)  # Global factory position
+CONVEYOR_VGR_INTERFACE_POS = (400, 100, 25)  # Same global position
 
 
 # =============================================================================
-# KINEMATIC CONTROLLER - Pulse Calculation and Sequence Generation
+# DATA CLASSES
 # =============================================================================
-
-@dataclass
-class MotionStep:
-    """Represents a single motion step in a sequence."""
-    axis: str           # 'X', 'Y', or 'Z'
-    target_mm: float    # Target position in mm
-    pulses: int         # Encoder pulses for this move
-    direction: int      # 1 = positive, -1 = negative, 0 = no move
-    description: str    # Human-readable description
-
 
 @dataclass
 class HBWPosition:
@@ -79,15 +96,38 @@ class HBWPosition:
     z: float = REST_POS[2]
     
     def as_tuple(self) -> Tuple[float, float, float]:
+        """Return position as (x, y, z) tuple."""
         return (self.x, self.y, self.z)
     
     def update(self, x: float = None, y: float = None, z: float = None):
+        """Update position coordinates (None values are ignored)."""
         if x is not None:
             self.x = x
         if y is not None:
             self.y = y
         if z is not None:
             self.z = z
+
+
+@dataclass
+class HardwarePosition:
+    """Tracks the current position and status of a hardware device."""
+    device_id: str
+    x: float
+    y: float
+    z: float
+    status: str
+
+
+@dataclass
+class QueuedCommand:
+    """Represents a command from the database queue."""
+    id: int
+    command_type: str
+    target_slot: Optional[str]
+    payload: dict
+    status: str
+    created_at: datetime
 
 
 class KinematicController:
@@ -106,11 +146,16 @@ class KinematicController:
     - Z: Arm extension (10=retracted, 25=carry, 50=extended)
     """
     
-    PULSES_PER_MM = PULSES_PER_MM  # 18.75
+    # Position offset constants for pick/place operations
+    APPROACH_OFFSET_MM = 10.0   # Approach from below
+    LIFT_OFFSET_MM = 10.0       # Lift above slot
+    HOVER_OFFSET_MM = 10.0      # Hover above conveyor
+    PLACE_OFFSET_MM = 5.0       # Lower to place
     
     def __init__(self):
         self.current_pos = HBWPosition()
-        self.is_carrying_mold = False
+        self._sequence: List[Dict] = []
+        self._sim_pos: Dict[str, float] = {}
     
     @staticmethod
     def calc_pulses(target_mm: float, current_mm: float) -> Tuple[int, int]:
@@ -141,19 +186,51 @@ class KinematicController:
         
         return (pulses, direction)
     
+    def _add_motion_step(self, axis: str, target: float, description: str):
+        """
+        Add a motion step to the current sequence (internal helper).
+        
+        Parameters
+        ----------
+        axis : str
+            Axis to move ('X', 'Y', or 'Z').
+        target : float
+            Target position in mm.
+        description : str
+            Human-readable description.
+        """
+        current = self._sim_pos.get(axis.lower(), 0)
+        pulses, direction = self.calc_pulses(target, current)
+        
+        # Update simulated position
+        self._sim_pos[axis.lower()] = target
+        
+        # Only add non-zero moves
+        if pulses > 0:
+            self._sequence.append({
+                'axis': axis,
+                'target': target,
+                'pulses': pulses,
+                'direction': direction,
+                'description': description,
+                'position': {
+                    'x': self._sim_pos['x'],
+                    'y': self._sim_pos['y'],
+                    'z': self._sim_pos['z'],
+                },
+            })
+    
+    def _init_sequence(self):
+        """Initialize a new sequence with current position."""
+        self._sequence = []
+        x, y, z = self.current_pos.as_tuple()
+        self._sim_pos = {'x': x, 'y': y, 'z': z}
+    
     def generate_retrieve_sequence(self, slot_name: str) -> List[Dict]:
         """
         Generate a "square path" sequence to retrieve a mold from a slot to the conveyor.
         
-        The robot never moves diagonally inside the rack area. Movement sequence:
-        1. Approach: Move X,Y to slot position (Y-10mm to go under mold), Z=retracted
-        2. Extend: Move Z to 50 (enter slot)
-        3. Lift: Move Y to slot Y+10mm (pick up mold)
-        4. Retract: Move Z to 25 (carry position)
-        5. Travel: Move X to conveyor X (400mm), keep Y steady
-        6. Align Drop: Move Y to conveyor Y+10 (hover above belt)
-        7. Place: Move Y to conveyor Y-5 (drop on belt)
-        8. Home: Retract Z to 10, move X,Y to REST_POS
+        The robot never moves diagonally inside the rack area.
         
         Parameters
         ----------
@@ -163,92 +240,45 @@ class KinematicController:
         Returns
         -------
         List[Dict]
-            List of command dictionaries with keys:
-            - axis: 'X', 'Y', or 'Z'
-            - target: target position in mm
-            - pulses: encoder pulses
-            - direction: movement direction
-            - description: step description
+            List of motion step dictionaries.
+        
+        Raises
+        ------
+        ValueError
+            If slot_name is not valid.
         """
         if slot_name not in SLOT_COORDINATES_3D:
-            raise ValueError(f"Invalid slot name: {slot_name}")
+            raise ValueError(f"Invalid slot name: {slot_name}. Valid slots: {list(SLOT_COORDINATES_3D.keys())}")
         
-        slot_x, slot_y, slot_z = SLOT_COORDINATES_3D[slot_name]
-        conv_x, conv_y, conv_z = CONVEYOR_POS
-        rest_x, rest_y, rest_z = REST_POS
+        slot_x, slot_y, _ = SLOT_COORDINATES_3D[slot_name]
+        conv_x, conv_y, _ = CONVEYOR_POS
+        rest_x, rest_y, _ = REST_POS
         
-        sequence = []
-        
-        # Track simulated position through sequence
-        sim_x, sim_y, sim_z = self.current_pos.as_tuple()
-        
-        def add_step(axis: str, target: float, desc: str):
-            nonlocal sim_x, sim_y, sim_z
-            if axis == 'X':
-                pulses, direction = self.calc_pulses(target, sim_x)
-                sim_x = target
-            elif axis == 'Y':
-                pulses, direction = self.calc_pulses(target, sim_y)
-                sim_y = target
-            elif axis == 'Z':
-                pulses, direction = self.calc_pulses(target, sim_z)
-                sim_z = target
-            else:
-                raise ValueError(f"Invalid axis: {axis}")
-            
-            if pulses > 0:  # Only add non-zero moves
-                sequence.append({
-                    'axis': axis,
-                    'target': target,
-                    'pulses': pulses,
-                    'direction': direction,
-                    'description': desc,
-                    'position': {'x': sim_x, 'y': sim_y, 'z': sim_z},
-                })
+        self._init_sequence()
         
         # === RETRIEVE SEQUENCE (Slot -> Conveyor) ===
         
-        # Step 1: Ensure Z is retracted for safe travel
-        add_step('Z', Z_RETRACTED, "Retract Z for safe travel")
+        # Phase 1: Safe travel to slot
+        self._add_motion_step('Z', Z_RETRACTED, "Retract Z for safe travel")
+        self._add_motion_step('X', slot_x, f"Move X to slot {slot_name} column")
         
-        # Step 2: Move X to slot column
-        add_step('X', slot_x, f"Move X to slot {slot_name} column")
+        # Phase 2: Pick up mold
+        self._add_motion_step('Y', slot_y - self.APPROACH_OFFSET_MM, f"Approach Y (under mold at {slot_name})")
+        self._add_motion_step('Z', Z_EXTENDED, "Extend Z into slot")
+        self._add_motion_step('Y', slot_y + self.LIFT_OFFSET_MM, "Lift Y to pick up mold")
+        self._add_motion_step('Z', Z_CARRY, "Retract Z to carry position")
         
-        # Step 3: Move Y to under the mold (slot Y - 10mm)
-        approach_y = slot_y - 10
-        add_step('Y', approach_y, f"Approach Y (under mold at {slot_name})")
+        # Phase 3: Travel to conveyor and place
+        self._add_motion_step('X', conv_x, "Travel X to conveyor")
+        self._add_motion_step('Y', conv_y + self.HOVER_OFFSET_MM, "Align Y above conveyor")
+        self._add_motion_step('Y', conv_y - self.PLACE_OFFSET_MM, "Lower Y to place on belt")
         
-        # Step 4: Extend Z into slot
-        add_step('Z', Z_EXTENDED, "Extend Z into slot")
+        # Phase 4: Return home
+        self._add_motion_step('Z', Z_RETRACTED, "Retract Z after placing")
+        self._add_motion_step('X', rest_x, "Return X to rest position")
+        self._add_motion_step('Y', rest_y, "Return Y to rest position")
         
-        # Step 5: Lift Y to pick up mold (slot Y + 10mm)
-        lift_y = slot_y + 10
-        add_step('Y', lift_y, "Lift Y to pick up mold")
-        
-        # Step 6: Retract Z to carry position
-        add_step('Z', Z_CARRY, "Retract Z to carry position")
-        
-        # Step 7: Travel X to conveyor (keep Y steady)
-        add_step('X', conv_x, "Travel X to conveyor")
-        
-        # Step 8: Align Y for drop (conveyor Y + 10mm to hover above)
-        hover_y = conv_y + 10
-        add_step('Y', hover_y, "Align Y above conveyor")
-        
-        # Step 9: Lower Y to place on belt (conveyor Y - 5mm)
-        place_y = conv_y - 5
-        add_step('Y', place_y, "Lower Y to place on belt")
-        
-        # Step 10: Home sequence - retract Z first
-        add_step('Z', Z_RETRACTED, "Retract Z after placing")
-        
-        # Step 11: Return to rest X
-        add_step('X', rest_x, "Return X to rest position")
-        
-        # Step 12: Return to rest Y
-        add_step('Y', rest_y, "Return Y to rest position")
-        
-        return sequence
+        return self._sequence.copy()
     
     def generate_store_sequence(self, slot_name: str) -> List[Dict]:
         """
@@ -264,80 +294,44 @@ class KinematicController:
         Returns
         -------
         List[Dict]
-            List of command dictionaries.
+            List of motion step dictionaries.
+        
+        Raises
+        ------
+        ValueError
+            If slot_name is not valid.
         """
         if slot_name not in SLOT_COORDINATES_3D:
-            raise ValueError(f"Invalid slot name: {slot_name}")
+            raise ValueError(f"Invalid slot name: {slot_name}. Valid slots: {list(SLOT_COORDINATES_3D.keys())}")
         
-        slot_x, slot_y, slot_z = SLOT_COORDINATES_3D[slot_name]
-        conv_x, conv_y, conv_z = CONVEYOR_POS
-        rest_x, rest_y, rest_z = REST_POS
+        slot_x, slot_y, _ = SLOT_COORDINATES_3D[slot_name]
+        conv_x, conv_y, _ = CONVEYOR_POS
+        rest_x, rest_y, _ = REST_POS
         
-        sequence = []
-        sim_x, sim_y, sim_z = self.current_pos.as_tuple()
-        
-        def add_step(axis: str, target: float, desc: str):
-            nonlocal sim_x, sim_y, sim_z
-            if axis == 'X':
-                pulses, direction = self.calc_pulses(target, sim_x)
-                sim_x = target
-            elif axis == 'Y':
-                pulses, direction = self.calc_pulses(target, sim_y)
-                sim_y = target
-            elif axis == 'Z':
-                pulses, direction = self.calc_pulses(target, sim_z)
-                sim_z = target
-            else:
-                raise ValueError(f"Invalid axis: {axis}")
-            
-            if pulses > 0:
-                sequence.append({
-                    'axis': axis,
-                    'target': target,
-                    'pulses': pulses,
-                    'direction': direction,
-                    'description': desc,
-                    'position': {'x': sim_x, 'y': sim_y, 'z': sim_z},
-                })
+        self._init_sequence()
         
         # === STORE SEQUENCE (Conveyor -> Slot) ===
         
-        # Step 1: Ensure Z is at carry height
-        add_step('Z', Z_CARRY, "Set Z to carry height")
+        # Phase 1: Pick up from conveyor
+        self._add_motion_step('Z', Z_CARRY, "Set Z to carry height")
+        self._add_motion_step('X', conv_x, "Move X to conveyor")
+        self._add_motion_step('Y', conv_y - self.APPROACH_OFFSET_MM, "Move Y under mold at conveyor")
+        self._add_motion_step('Y', conv_y + self.PLACE_OFFSET_MM, "Lift Y to pick up mold from belt")
         
-        # Step 2: Move X to conveyor
-        add_step('X', conv_x, "Move X to conveyor")
+        # Phase 2: Travel to slot
+        self._add_motion_step('X', slot_x, f"Travel X to slot {slot_name} column")
+        self._add_motion_step('Y', slot_y + self.LIFT_OFFSET_MM, f"Move Y above slot {slot_name}")
         
-        # Step 3: Move Y to under mold position (conveyor Y - 10mm)
-        pickup_y = conv_y - 10
-        add_step('Y', pickup_y, "Move Y under mold at conveyor")
+        # Phase 3: Place in slot
+        self._add_motion_step('Z', Z_EXTENDED, "Extend Z into slot")
+        self._add_motion_step('Y', slot_y - self.APPROACH_OFFSET_MM, "Lower Y to release mold in slot")
+        self._add_motion_step('Z', Z_RETRACTED, "Retract Z after storing")
         
-        # Step 4: Lift Y to pick up mold
-        lift_y = conv_y + 5
-        add_step('Y', lift_y, "Lift Y to pick up mold from belt")
+        # Phase 4: Return home
+        self._add_motion_step('X', rest_x, "Return X to rest position")
+        self._add_motion_step('Y', rest_y, "Return Y to rest position")
         
-        # Step 5: Travel X to slot column
-        add_step('X', slot_x, f"Travel X to slot {slot_name} column")
-        
-        # Step 6: Move Y above slot (slot Y + 10mm)
-        above_slot_y = slot_y + 10
-        add_step('Y', above_slot_y, f"Move Y above slot {slot_name}")
-        
-        # Step 7: Extend Z into slot
-        add_step('Z', Z_EXTENDED, "Extend Z into slot")
-        
-        # Step 8: Lower Y to place mold (slot Y - 10mm to release)
-        place_y = slot_y - 10
-        add_step('Y', place_y, "Lower Y to release mold in slot")
-        
-        # Step 9: Retract Z
-        add_step('Z', Z_RETRACTED, "Retract Z after storing")
-        
-        # Step 10: Return to rest
-        add_step('X', rest_x, "Return X to rest position")
-        add_step('Y', rest_y, "Return Y to rest position")
-        
-        return sequence
+        return self._sequence.copy()
     
     def update_position(self, x: float = None, y: float = None, z: float = None):
         """Update the tracked position of the robot."""
@@ -350,39 +344,13 @@ class KinematicController:
 
 class ControllerState(Enum):
     """Finite State Machine states for the controller."""
-    IDLE = auto()
-    POLLING = auto()
-    EXECUTING = auto()
-    EXECUTING_SEQUENCE = auto()  # New: executing kinematic sequence
-    MOVING_TO_SLOT = auto()
-    PICKING = auto()
-    MOVING_TO_CONVEYOR = auto()
-    PLACING = auto()
-    WAITING_OVEN = auto()
-    RETURNING = auto()
-    ERROR = auto()
-    EMERGENCY_STOP = auto()
-
-
-@dataclass
-class HardwarePosition:
-    """Tracks the current position and status of a hardware device."""
-    device_id: str
-    x: float
-    y: float
-    z: float
-    status: str
-
-
-@dataclass
-class QueuedCommand:
-    """Represents a command from the database queue."""
-    id: int
-    command_type: str
-    target_slot: Optional[str]
-    payload: dict
-    status: str
-    created_at: datetime
+    IDLE = auto()              # Controller is waiting for commands
+    POLLING = auto()           # Polling database for pending commands
+    EXECUTING = auto()         # Processing a command
+    EXECUTING_SEQUENCE = auto()  # Executing kinematic motion sequence
+    WAITING_OVEN = auto()      # Waiting for oven/processing cycle
+    ERROR = auto()             # Error state (recoverable)
+    EMERGENCY_STOP = auto()    # Emergency stop activated (manual reset required)
 
 
 class MainController:
@@ -431,36 +399,50 @@ class MainController:
     # MQTT Setup and Handlers
     # =========================================================================
     
-    def setup_mqtt(self):
-        """Initialize MQTT client for hardware communication."""
+    def setup_mqtt(self) -> bool:
+        """
+        Initialize MQTT client for hardware communication.
+        
+        Returns
+        -------
+        bool
+            True if MQTT connected successfully, False otherwise.
+        """
         if not MQTT_AVAILABLE:
             print("[Controller] MQTT not available - running in simulation mode")
-            return
-        
-        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="stf_controller")
-        self.mqtt_client.on_connect = self._on_mqtt_connect
-        self.mqtt_client.on_message = self._on_mqtt_message
+            return False
         
         try:
+            self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="stf_controller")
+            self.mqtt_client.on_connect = self._on_mqtt_connect
+            self.mqtt_client.on_message = self._on_mqtt_message
+            
             self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
             self.mqtt_client.loop_start()
             print(f"[Controller] Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
+            return True
         except Exception as e:
             print(f"[Controller] MQTT connection failed: {e}")
             self.mqtt_client = None
+            return False
     
     def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties=None):
         """Handle MQTT connection and subscribe to topics."""
-        if reason_code == 0 or str(reason_code) == "Success":
-            topics = [
-                "stf/hbw/status",
-                "stf/vgr/status", 
-                "stf/conveyor/status",
-                "stf/global/emergency",
-            ]
-            for topic in topics:
-                client.subscribe(topic)
-            print("[Controller] Subscribed to hardware status topics")
+        try:
+            if reason_code == 0 or str(reason_code) == "Success":
+                topics = [
+                    "stf/hbw/status",
+                    "stf/vgr/status", 
+                    "stf/conveyor/status",
+                    "stf/global/emergency",
+                ]
+                for topic in topics:
+                    client.subscribe(topic)
+                print("[Controller] Subscribed to hardware status topics")
+            else:
+                print(f"[Controller] MQTT connection failed with reason: {reason_code}")
+        except Exception as e:
+            print(f"[Controller] Error in MQTT connect handler: {e}")
     
     def _on_mqtt_message(self, client, userdata, msg):
         """Handle incoming MQTT messages from hardware."""
@@ -480,15 +462,18 @@ class MainController:
     
     def _update_hardware_position(self, payload: dict):
         """Update tracked hardware position from MQTT status."""
-        device_id = payload.get("device_id")
-        if device_id:
-            self.hardware_positions[device_id] = HardwarePosition(
-                device_id=device_id,
-                x=payload.get("x", 0),
-                y=payload.get("y", 0),
-                z=payload.get("z", 0),
-                status=payload.get("status", "UNKNOWN"),
-            )
+        try:
+            device_id = payload.get("device_id")
+            if device_id:
+                self.hardware_positions[device_id] = HardwarePosition(
+                    device_id=device_id,
+                    x=float(payload.get("x", 0)),
+                    y=float(payload.get("y", 0)),
+                    z=float(payload.get("z", 0)),
+                    status=str(payload.get("status", "UNKNOWN")),
+                )
+        except (TypeError, ValueError) as e:
+            print(f"[Controller] Error parsing hardware position: {e}")
     
     def _handle_emergency_stop(self):
         """Activate emergency stop mode."""
@@ -496,8 +481,12 @@ class MainController:
         self.state = ControllerState.EMERGENCY_STOP
         
         if self.mqtt_client:
-            for device in ["hbw", "vgr", "conveyor"]:
-                self.mqtt_client.publish(f"stf/{device}/cmd/stop", json.dumps({"action": "stop"}))
+            try:
+                for device in [DEVICE_HBW, DEVICE_VGR, DEVICE_CONVEYOR]:
+                    topic = f"{MQTT_TOPIC_PREFIX}/{device}/{MQTT_CMD_STOP}"
+                    self.mqtt_client.publish(topic, json.dumps({"action": "stop"}))
+            except Exception as e:
+                print(f"[Controller] MQTT emergency stop error: {e}")
         
         print("[Controller] *** EMERGENCY STOP ACTIVATED ***")
     
@@ -534,9 +523,12 @@ class MainController:
         
         # Send MQTT command
         if self.mqtt_client:
-            topic = f"stf/{device_id.lower()}/cmd/move"
-            payload = {"x": x, "y": y, "z": 0}
-            self.mqtt_client.publish(topic, json.dumps(payload))
+            try:
+                topic = f"{MQTT_TOPIC_PREFIX}/{device_id.lower()}/{MQTT_CMD_MOVE}"
+                payload = {"x": x, "y": y, "z": 0}
+                self.mqtt_client.publish(topic, json.dumps(payload))
+            except Exception as e:
+                print(f"[Controller] MQTT move command error: {e}")
         
         print(f"[Controller] MOVE {device_id} -> ({x}, {y})")
         return True
@@ -544,22 +536,277 @@ class MainController:
     async def _send_gripper_command(self, device_id: str, action: str):
         """Send gripper command (open/close/extend/retract)."""
         if self.mqtt_client:
-            topic = f"stf/{device_id.lower()}/cmd/gripper"
-            payload = {"action": action}
-            self.mqtt_client.publish(topic, json.dumps(payload))
+            try:
+                topic = f"{MQTT_TOPIC_PREFIX}/{device_id.lower()}/{MQTT_CMD_GRIPPER}"
+                payload = {"action": action}
+                self.mqtt_client.publish(topic, json.dumps(payload))
+            except Exception as e:
+                print(f"[Controller] MQTT gripper command error: {e}")
         
         print(f"[Controller] GRIPPER {device_id} -> {action}")
     
     async def _send_conveyor_command(self, action: str, speed: float = 100):
         """Send conveyor belt command."""
         if self.mqtt_client:
-            topic = "stf/conveyor/cmd/belt"
-            payload = {"action": action, "speed": speed}
-            self.mqtt_client.publish(topic, json.dumps(payload))
+            try:
+                topic = f"{MQTT_TOPIC_PREFIX}/{DEVICE_CONVEYOR}/{MQTT_CMD_BELT}"
+                payload = {"action": action, "speed": speed}
+                self.mqtt_client.publish(topic, json.dumps(payload))
+            except Exception as e:
+                print(f"[Controller] MQTT conveyor command error: {e}")
         
         print(f"[Controller] CONVEYOR -> {action}")
     
-    async def _wait_for_idle(self, device_id: str, timeout: float = 30.0) -> bool:
+    # =========================================================================
+    # SENSOR-BASED CONVEYOR CONTROL
+    # These methods use Light Barrier sensors (I2, I3) for positioning
+    # instead of encoder-based position tracking.
+    # =========================================================================
+
+    async def _get_conveyor_sensors(self) -> Dict[str, bool]:
+        """
+        Fetch current conveyor sensor states from API.
+        
+        Returns
+        -------
+        Dict[str, bool]
+            Sensor states: {"I2": bool, "I3": bool, "I5": bool, "I6": bool}
+        
+        Raises
+        ------
+        RuntimeError
+            If unable to fetch sensor states from API.
+        """
+        try:
+            response = await self.http_client.get(f"{API_URL}/hardware/states")
+            if response.status_code == 200:
+                states = response.json()
+                for hw in states:
+                    if hw.get("device_id") == "CONVEYOR":
+                        light_barriers = hw.get("light_barriers", {})
+                        return {
+                            "I2": light_barriers.get("I2", {}).get("is_triggered", False),
+                            "I3": light_barriers.get("I3", {}).get("is_triggered", False),
+                            "I5": hw.get("trail_sensors", {}).get("I5", {}).get("is_triggered", False),
+                            "I6": hw.get("trail_sensors", {}).get("I6", {}).get("is_triggered", False),
+                        }
+        except Exception as e:
+            print(f"[Controller] Error fetching conveyor sensors: {e}")
+        
+        raise RuntimeError("Unable to fetch conveyor sensor states")
+    
+    async def move_conveyor_inbound(self) -> Dict:
+        """
+        Move item from VGR side to HBW side (inbound transport).
+        
+        Direction: VGR → HBW (forward, direction=1)
+        Monitors: I2 sensor (triggers when item reaches HBW interface at ~105mm on 120mm belt)
+        
+        Workflow:
+        1. Congestion Check: Verify I2 is not already triggered (slot not blocked)
+        2. Start: Send MQTT command to start Motor M1 (forward/inward)
+        3. Monitor: Poll I2 sensor in a loop
+        4. Stop: When I2 triggers, immediately stop motor
+        5. State: Update carrier state to HBW interface position (400, 100, 25)
+        6. Safety: 5-second timeout with automatic stop if reached
+        
+        Returns
+        -------
+        Dict
+            Result with "success" bool, "message" str, and "position" tuple.
+        
+        Raises
+        ------
+        RuntimeError
+            If HBW interface is blocked (I2 already triggered) or timeout occurs.
+        """
+        print("[Controller] CONVEYOR INBOUND: VGR → HBW transport starting...")
+        
+        # Step 1: Congestion Check
+        try:
+            sensors = await self._get_conveyor_sensors()
+            if sensors["I2"]:
+                raise RuntimeError("Conveyor INBOUND blocked: I2 sensor triggered (HBW interface occupied)")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            print(f"[Controller] Warning: Could not check congestion: {e}")
+        
+        # Step 2: Start motor (forward direction = 1)
+        await self._send_conveyor_command("start_forward", speed=100)
+        if self.mqtt_client:
+            try:
+                topic = f"{MQTT_TOPIC_PREFIX}/{DEVICE_CONVEYOR}/{MQTT_CMD_MOTOR}"
+                payload = {"action": "start", "direction": 1, "motor": "M1"}  # Q1/Inwards
+                self.mqtt_client.publish(topic, json.dumps(payload))
+            except Exception as e:
+                print(f"[Controller] MQTT motor start error: {e}")
+        
+        print("[Controller] CONVEYOR M1 started (direction: INWARD/Q1)")
+        
+        # Step 3: Monitor I2 sensor with timeout
+        start_time = time.time()
+        i2_triggered = False
+        
+        while time.time() - start_time < CONVEYOR_TIMEOUT_SEC:
+            try:
+                sensors = await self._get_conveyor_sensors()
+                if sensors["I2"]:
+                    i2_triggered = True
+                    break
+            except Exception as e:
+                print(f"[Controller] Sensor poll error: {e}")
+            
+            await asyncio.sleep(SENSOR_POLL_INTERVAL_SEC)  # Poll at 10Hz
+        
+        # Step 4: Stop motor immediately
+        await self._send_conveyor_command("stop")
+        if self.mqtt_client:
+            try:
+                topic = f"{MQTT_TOPIC_PREFIX}/{DEVICE_CONVEYOR}/{MQTT_CMD_MOTOR}"
+                payload = {"action": "stop", "motor": "M1"}
+                self.mqtt_client.publish(topic, json.dumps(payload))
+            except Exception as e:
+                print(f"[Controller] MQTT motor stop error: {e}")
+        
+        print("[Controller] CONVEYOR M1 stopped")
+        
+        # Step 5: Check result and update state
+        if not i2_triggered:
+            raise RuntimeError(f"Conveyor JAMMED: I2 not triggered within {CONVEYOR_TIMEOUT_SEC}s timeout")
+        
+        # Update state: item is now at HBW interface
+        position = CONVEYOR_HBW_INTERFACE_POS
+        print(f"[Controller] CONVEYOR INBOUND complete: Item at HBW interface {position}")
+        
+        # Update API with new carrier position
+        try:
+            await self.http_client.post(
+                f"{API_URL}/hardware/state",
+                json={
+                    "device_id": "CONVEYOR",
+                    "x": position[0],
+                    "y": position[1],
+                    "z": position[2],
+                    "status": "IDLE",
+                    "message": "Item at HBW interface (I2 triggered)"
+                }
+            )
+        except Exception as e:
+            print(f"[Controller] API state update error: {e}")
+        
+        return {
+            "success": True,
+            "message": "Item transported to HBW interface",
+            "position": position,
+            "sensor_triggered": "I2"
+        }
+    
+    async def move_conveyor_outbound(self) -> Dict:
+        """
+        Move item from HBW side to VGR side (outbound transport).
+        
+        Direction: HBW → VGR (reverse, direction=-1)
+        Monitors: I3 sensor (triggers when item reaches VGR interface at ~15mm on 120mm belt)
+        
+        Workflow:
+        1. Congestion Check: Verify I3 is not already triggered (exit not blocked)
+        2. Start: Send MQTT command to start Motor M1 (reverse/outward)
+        3. Monitor: Poll I3 sensor in a loop
+        4. Stop: When I3 triggers, immediately stop motor
+        5. Safety: 5-second timeout with automatic stop if reached
+        
+        Returns
+        -------
+        Dict
+            Result with "success" bool, "message" str.
+        
+        Raises
+        ------
+        RuntimeError
+            If VGR interface is blocked (I3 already triggered) or timeout occurs.
+        """
+        print("[Controller] CONVEYOR OUTBOUND: HBW → VGR transport starting...")
+        
+        # Step 1: Congestion Check
+        try:
+            sensors = await self._get_conveyor_sensors()
+            if sensors["I3"]:
+                raise RuntimeError("Conveyor OUTBOUND blocked: I3 sensor triggered (VGR interface occupied)")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            print(f"[Controller] Warning: Could not check congestion: {e}")
+        
+        # Step 2: Start motor (reverse direction = -1)
+        await self._send_conveyor_command("start_reverse", speed=100)
+        if self.mqtt_client:
+            try:
+                topic = f"{MQTT_TOPIC_PREFIX}/{DEVICE_CONVEYOR}/{MQTT_CMD_MOTOR}"
+                payload = {"action": "start", "direction": -1, "motor": "M1"}  # Q2/Outwards
+                self.mqtt_client.publish(topic, json.dumps(payload))
+            except Exception as e:
+                print(f"[Controller] MQTT motor start error: {e}")
+        
+        print("[Controller] CONVEYOR M1 started (direction: OUTWARD/Q2)")
+        
+        # Step 3: Monitor I3 sensor with timeout
+        start_time = time.time()
+        i3_triggered = False
+        
+        while time.time() - start_time < CONVEYOR_TIMEOUT_SEC:
+            try:
+                sensors = await self._get_conveyor_sensors()
+                if sensors["I3"]:
+                    i3_triggered = True
+                    break
+            except Exception as e:
+                print(f"[Controller] Sensor poll error: {e}")
+            
+            await asyncio.sleep(SENSOR_POLL_INTERVAL_SEC)  # Poll at 10Hz
+        
+        # Step 4: Stop motor immediately
+        await self._send_conveyor_command("stop")
+        if self.mqtt_client:
+            try:
+                topic = f"{MQTT_TOPIC_PREFIX}/{DEVICE_CONVEYOR}/{MQTT_CMD_MOTOR}"
+                payload = {"action": "stop", "motor": "M1"}
+                self.mqtt_client.publish(topic, json.dumps(payload))
+            except Exception as e:
+                print(f"[Controller] MQTT motor stop error: {e}")
+        
+        print("[Controller] CONVEYOR M1 stopped")
+        
+        # Step 5: Check result
+        if not i3_triggered:
+            raise RuntimeError(f"Conveyor JAMMED: I3 not triggered within {CONVEYOR_TIMEOUT_SEC}s timeout")
+        
+        print("[Controller] CONVEYOR OUTBOUND complete: Item at VGR interface (I3 triggered)")
+        
+        # Update API state - VGR interface at same global position
+        vgr_pos = CONVEYOR_VGR_INTERFACE_POS
+        try:
+            await self.http_client.post(
+                f"{API_URL}/hardware/state",
+                json={
+                    "device_id": "CONVEYOR",
+                    "x": vgr_pos[0],
+                    "y": vgr_pos[1],
+                    "z": vgr_pos[2],
+                    "status": "IDLE",
+                    "message": "Item at VGR interface (I3 triggered)"
+                }
+            )
+        except Exception as e:
+            print(f"[Controller] API state update error: {e}")
+        
+        return {
+            "success": True,
+            "message": "Item transported to VGR interface",
+            "sensor_triggered": "I3"
+        }
+
+    async def _wait_for_idle(self, device_id: str, timeout: float = DEFAULT_MOVE_TIMEOUT_SEC) -> bool:
         """
         Wait for a device to return to IDLE status.
         
@@ -575,6 +822,10 @@ class MainController:
         bool
             True if device is IDLE, False if timeout.
         """
+        if not self.http_client:
+            print(f"[Controller] HTTP client not available for {device_id} status check")
+            return False
+            
         start_time = time.time()
         while time.time() - start_time < timeout:
             # Check API for current status
@@ -583,10 +834,10 @@ class MainController:
                 if response.status_code == 200:
                     states = response.json()
                     for hw in states:
-                        if hw["device_id"] == device_id and hw["status"] == "IDLE":
+                        if hw.get("device_id") == device_id and hw.get("status") == "IDLE":
                             return True
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Controller] Error checking {device_id} status: {e}")
             
             await asyncio.sleep(0.5)
         
@@ -668,6 +919,10 @@ class MainController:
         bool
             True if sequence completed successfully, False on error.
         """
+        if not sequence:
+            print(f"[Kinematic] Warning: Empty sequence for '{description}'")
+            return True
+            
         self.state = ControllerState.EXECUTING_SEQUENCE
         
         print(f"\n[Kinematic] Starting sequence: {description}")
@@ -675,33 +930,43 @@ class MainController:
         print("=" * 60)
         
         for i, step in enumerate(sequence):
-            axis = step['axis']
-            target = step['target']
-            pulses = step['pulses']
-            direction = step['direction']
-            desc = step['description']
-            pos = step['position']
-            
-            dir_str = "+" if direction > 0 else "-" if direction < 0 else "="
-            
-            print(f"\n[Step {i+1}/{len(sequence)}] {desc}")
-            print(f"  Axis: {axis}, Target: {target:.1f}mm, Pulses: {pulses}, Dir: {dir_str}")
-            print(f"  New Position: X={pos['x']:.1f}, Y={pos['y']:.1f}, Z={pos['z']:.1f}")
-            
-            # Send MQTT command for this axis movement
-            await self._send_axis_move_command("HBW", axis, target, pulses, direction)
-            
-            # Update API with new position
-            await self._update_hardware_position_api("HBW", pos['x'], pos['y'], pos['z'], "MOVING")
-            
-            # Wait for hardware to complete movement
-            await self._wait_for_idle("HBW", timeout=15)
-            
-            # Update position tracking
-            self.kinematics.update_position(x=pos['x'], y=pos['y'], z=pos['z'])
-            
-            # Update API status to IDLE
-            await self._update_hardware_position_api("HBW", pos['x'], pos['y'], pos['z'], "IDLE")
+            try:
+                axis = step['axis']
+                target = step['target']
+                pulses = step['pulses']
+                direction = step['direction']
+                desc = step['description']
+                pos = step['position']
+                
+                dir_str = "+" if direction > 0 else "-" if direction < 0 else "="
+                
+                print(f"\n[Step {i+1}/{len(sequence)}] {desc}")
+                print(f"  Axis: {axis}, Target: {target:.1f}mm, Pulses: {pulses}, Dir: {dir_str}")
+                print(f"  New Position: X={pos['x']:.1f}, Y={pos['y']:.1f}, Z={pos['z']:.1f}")
+                
+                # Send MQTT command for this axis movement
+                await self._send_axis_move_command("HBW", axis, target, pulses, direction)
+                
+                # Update API with new position
+                await self._update_hardware_position_api("HBW", pos['x'], pos['y'], pos['z'], "MOVING")
+                
+                # Wait for hardware to complete movement
+                if not await self._wait_for_idle("HBW", timeout=DEFAULT_MOVE_TIMEOUT_SEC):
+                    print(f"[Kinematic] Step {i+1} timed out waiting for IDLE")
+                    return False
+                
+                # Update position tracking
+                self.kinematics.update_position(x=pos['x'], y=pos['y'], z=pos['z'])
+                
+                # Update API status to IDLE
+                await self._update_hardware_position_api("HBW", pos['x'], pos['y'], pos['z'], "IDLE")
+                
+            except KeyError as e:
+                print(f"[Kinematic] Step {i+1} missing required field: {e}")
+                return False
+            except Exception as e:
+                print(f"[Kinematic] Step {i+1} failed with error: {e}")
+                return False
         
         print(f"\n[Kinematic] Sequence complete: {description}")
         print("=" * 60)
@@ -741,17 +1006,20 @@ class MainController:
         
         # Send MQTT command with kinematic data
         if self.mqtt_client:
-            topic = f"stf/{device_id.lower()}/cmd/move"
-            payload = {
-                'x': pos_update['x'],
-                'y': pos_update['y'],
-                'z': pos_update['z'],
-                'axis': axis,
-                'pulses': pulses,
-                'direction': direction,
-            }
-            self.mqtt_client.publish(topic, json.dumps(payload))
-            print(f"  [MQTT] Published: {topic} = {payload}")
+            try:
+                topic = f"{MQTT_TOPIC_PREFIX}/{device_id.lower()}/{MQTT_CMD_MOVE}"
+                payload = {
+                    'x': pos_update['x'],
+                    'y': pos_update['y'],
+                    'z': pos_update['z'],
+                    'axis': axis,
+                    'pulses': pulses,
+                    'direction': direction,
+                }
+                self.mqtt_client.publish(topic, json.dumps(payload))
+                print(f"  [MQTT] Published: {topic} = {payload}")
+            except Exception as e:
+                print(f"[Controller] MQTT axis move error: {e}")
         
         return True
     
@@ -765,7 +1033,7 @@ class MainController:
         except Exception as e:
             print(f"[Controller] API position update error: {e}")
     
-    async def _execute_process_command(self, cmd: QueuedCommand):
+    async def _execute_process_command(self, cmd: QueuedCommand) -> bool:
         """
         Execute a PROCESS command (RAW_DOUGH -> BAKED) using kinematic sequences.
         
@@ -773,6 +1041,16 @@ class MainController:
         1. Retrieve mold from slot to conveyor (kinematic sequence)
         2. Run oven cycle on conveyor
         3. Store mold back from conveyor to slot (kinematic sequence)
+        
+        Parameters
+        ----------
+        cmd : QueuedCommand
+            The command to execute.
+        
+        Returns
+        -------
+        bool
+            True if command completed successfully, False on error.
         """
         slot_name = cmd.target_slot
         if not slot_name or slot_name not in SLOT_COORDINATES_3D:
@@ -785,7 +1063,7 @@ class MainController:
             # =============================================
             # Phase 1: Retrieve mold from slot to conveyor
             # =============================================
-            self.state = ControllerState.MOVING_TO_SLOT
+            self.state = ControllerState.EXECUTING
             print(f"\n{'='*60}")
             print(f"[Controller] PROCESS: Retrieving mold from {slot_name}")
             print(f"{'='*60}")
@@ -806,14 +1084,14 @@ class MainController:
             self.state = ControllerState.WAITING_OVEN
             print(f"\n[Controller] Starting oven cycle...")
             await self._send_conveyor_command("start")
-            await asyncio.sleep(3.0)  # Simulated baking time
+            await asyncio.sleep(OVEN_CYCLE_DURATION_SEC)
             await self._send_conveyor_command("stop")
             print(f"[Controller] Oven cycle complete")
             
             # =============================================
             # Phase 3: Store mold back from conveyor to slot
             # =============================================
-            self.state = ControllerState.RETURNING
+            self.state = ControllerState.EXECUTING
             print(f"\n{'='*60}")
             print(f"[Controller] PROCESS: Storing baked mold back to {slot_name}")
             print(f"{'='*60}")
@@ -832,7 +1110,7 @@ class MainController:
             # Complete
             # =============================================
             elapsed_time = time.time() - self.command_start_time
-            energy_joules = 24.0 * 1.5 * elapsed_time  # V * A * s
+            energy_joules = MOTOR_VOLTAGE * MOTOR_CURRENT_PROCESS * elapsed_time  # V * A * s
             await self._log_energy(energy_joules, elapsed_time)
             
             print(f"\n[Controller] PROCESS complete for {slot_name}")
@@ -842,12 +1120,24 @@ class MainController:
             
         except Exception as e:
             print(f"[Controller] Error executing PROCESS: {e}")
-            import traceback
-            traceback.print_exc()
             return False
     
-    async def _execute_store_command(self, cmd: QueuedCommand):
-        """Execute a STORE command using kinematic sequence."""
+    async def _execute_store_command(self, cmd: QueuedCommand) -> bool:
+        """
+        Execute a STORE command using kinematic sequence.
+        
+        Moves a mold from the conveyor to the specified slot.
+        
+        Parameters
+        ----------
+        cmd : QueuedCommand
+            The command to execute.
+        
+        Returns
+        -------
+        bool
+            True if command completed successfully, False on error.
+        """
         slot_name = cmd.target_slot
         if not slot_name or slot_name not in SLOT_COORDINATES_3D:
             print(f"[Controller] Invalid slot: {slot_name}")
@@ -868,7 +1158,7 @@ class MainController:
             await asyncio.sleep(0.5)
             
             elapsed_time = time.time() - self.command_start_time
-            energy_joules = 24.0 * 1.2 * elapsed_time
+            energy_joules = MOTOR_VOLTAGE * MOTOR_CURRENT_MOVE * elapsed_time
             await self._log_energy(energy_joules, elapsed_time)
             
             print(f"[Controller] STORE complete for {slot_name}")
@@ -878,8 +1168,22 @@ class MainController:
             print(f"[Controller] Error executing STORE: {e}")
             return False
     
-    async def _execute_retrieve_command(self, cmd: QueuedCommand):
-        """Execute a RETRIEVE command using kinematic sequence."""
+    async def _execute_retrieve_command(self, cmd: QueuedCommand) -> bool:
+        """
+        Execute a RETRIEVE command using kinematic sequence.
+        
+        Moves a mold from the specified slot to the conveyor.
+        
+        Parameters
+        ----------
+        cmd : QueuedCommand
+            The command to execute.
+        
+        Returns
+        -------
+        bool
+            True if command completed successfully, False on error.
+        """
         slot_name = cmd.target_slot
         if not slot_name or slot_name not in SLOT_COORDINATES_3D:
             print(f"[Controller] Invalid slot: {slot_name}")
@@ -903,7 +1207,7 @@ class MainController:
                 return False
             
             elapsed_time = time.time() - self.command_start_time
-            energy_joules = 24.0 * 1.2 * elapsed_time
+            energy_joules = MOTOR_VOLTAGE * MOTOR_CURRENT_MOVE * elapsed_time
             await self._log_energy(energy_joules, elapsed_time)
             
             print(f"[Controller] RETRIEVE complete for {slot_name}")
@@ -921,8 +1225,8 @@ class MainController:
                 json={
                     "device_id": "HBW",
                     "joules": joules,
-                    "voltage": 24.0,
-                    "current_amps": joules / (24.0 * duration_sec) if duration_sec > 0 else 0,
+                    "voltage": MOTOR_VOLTAGE,
+                    "current_amps": joules / (MOTOR_VOLTAGE * duration_sec) if duration_sec > 0 else 0,
                     "power_watts": joules / duration_sec if duration_sec > 0 else 0,
                 }
             )
@@ -946,67 +1250,79 @@ class MainController:
         self.running = True
         self.setup_mqtt()
         
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            self.http_client = client
-            
-            print("=" * 60)
-            print("STF Digital Twin - Command Queue Controller")
-            print("=" * 60)
-            print(f"API URL: {API_URL}")
-            print(f"Poll Interval: {POLL_INTERVAL}s")
-            print("=" * 60)
-            
-            while self.running:
-                try:
-                    if self.emergency_stop_active:
-                        print("[Controller] Emergency stop active - waiting for reset")
-                        await asyncio.sleep(5.0)
-                        continue
-                    
-                    # Poll for pending commands
-                    self.state = ControllerState.POLLING
-                    cmd = await self._poll_pending_commands()
-                    
-                    if cmd:
-                        print(f"\n[Controller] Processing command #{cmd.id}: {cmd.command_type}")
-                        self.current_command = cmd
-                        self.state = ControllerState.EXECUTING
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                self.http_client = client
+                
+                print("=" * 60)
+                print("STF Digital Twin - Command Queue Controller")
+                print("=" * 60)
+                print(f"API URL: {API_URL}")
+                print(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
+                print(f"Poll Interval: {POLL_INTERVAL}s")
+                print("=" * 60)
+                
+                while self.running:
+                    try:
+                        if self.emergency_stop_active:
+                            print("[Controller] Emergency stop active - waiting for reset")
+                            await asyncio.sleep(5.0)
+                            continue
                         
-                        # Update status to IN_PROGRESS
-                        await self._update_command_status(cmd.id, "IN_PROGRESS")
+                        # Poll for pending commands
+                        self.state = ControllerState.POLLING
+                        cmd = await self._poll_pending_commands()
                         
-                        # Execute based on command type
-                        success = False
-                        if cmd.command_type == "PROCESS":
-                            success = await self._execute_process_command(cmd)
-                        elif cmd.command_type == "STORE":
-                            success = await self._execute_store_command(cmd)
-                        elif cmd.command_type == "RETRIEVE":
-                            success = await self._execute_retrieve_command(cmd)
-                        else:
-                            print(f"[Controller] Unknown command type: {cmd.command_type}")
+                        if cmd:
+                            print(f"\n[Controller] Processing command #{cmd.id}: {cmd.command_type}")
+                            self.current_command = cmd
+                            self.state = ControllerState.EXECUTING
+                            
+                            # Update status to IN_PROGRESS
+                            await self._update_command_status(cmd.id, "IN_PROGRESS")
+                            
+                            # Execute based on command type
+                            success = False
+                            if cmd.command_type == "PROCESS":
+                                success = await self._execute_process_command(cmd)
+                            elif cmd.command_type == "STORE":
+                                success = await self._execute_store_command(cmd)
+                            elif cmd.command_type == "RETRIEVE":
+                                success = await self._execute_retrieve_command(cmd)
+                            else:
+                                print(f"[Controller] Unknown command type: {cmd.command_type}")
+                            
+                            # Update final status
+                            final_status = "COMPLETED" if success else "FAILED"
+                            await self._update_command_status(cmd.id, final_status)
+                            
+                            self.current_command = None
                         
-                        # Update final status
-                        final_status = "COMPLETED" if success else "FAILED"
-                        await self._update_command_status(cmd.id, final_status)
+                        # Return to idle
+                        self.state = ControllerState.IDLE
+                        await asyncio.sleep(POLL_INTERVAL)
                         
-                        self.current_command = None
-                    
-                    # Return to idle
-                    self.state = ControllerState.IDLE
-                    await asyncio.sleep(POLL_INTERVAL)
-                    
-                except Exception as e:
-                    print(f"[Controller] Error in main loop: {e}")
-                    self.state = ControllerState.ERROR
-                    await asyncio.sleep(2.0)
+                    except Exception as e:
+                        print(f"[Controller] Error in main loop: {e}")
+                        self.state = ControllerState.ERROR
+                        await asyncio.sleep(2.0)
         
-        # Cleanup
-        if self.mqtt_client:
-            self.mqtt_client.loop_stop()
-            self.mqtt_client.disconnect()
+        finally:
+            # Cleanup MQTT connection
+            self._cleanup_mqtt()
         
         print("[Controller] Shutdown complete")
+    
+    def _cleanup_mqtt(self):
+        """Clean up MQTT client connection."""
+        if self.mqtt_client:
+            try:
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+            except Exception as e:
+                print(f"[Controller] MQTT cleanup error: {e}")
+            finally:
+                self.mqtt_client = None
     
     def stop(self):
         """Stop the controller gracefully."""

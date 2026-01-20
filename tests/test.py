@@ -18,7 +18,6 @@ Requirements:
     - SQLite database file must be accessible (default: ./stf_digital_twin.db)
     - Alternatively, set DATABASE_URL environment variable to use a different database
 
-Author: Manus AI
 """
 
 import argparse

@@ -1021,3 +1021,4 @@ def update_command_status(command_id: int, status_update: dict, db: Session = De
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

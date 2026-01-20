@@ -20,8 +20,8 @@ The system is built on a decoupled, event-driven architecture:
 │  │  Dashboard   │    │  (Queue Command) │    │  (.db file)  │          │
 │  │  (Port 8501) │    │   (Port 8000)    │    │              │          │
 │  └──────────────┘    └──────────────────┘    └──────▲───────┘          │
-│                                                     │ (Polls)           │
-│                                                     │                   │
+│                                |                     │ (Polls)           │
+│                                |                     │                   │
 │  ┌──────────────────────────────────────────────────┴─────────────────┐  │
 │  │              Main Controller (Command Queue Processor)             │  │
 │  │  • Polls DB for PENDING commands                                  │  │
@@ -46,12 +46,14 @@ The system is built on a decoupled, event-driven architecture:
 ## Key Features
 
 ### Command Queue Architecture
+
 - **Reliable Execution**: API endpoints queue commands in the database with `PENDING` status.
 - **Decoupled Controller**: The `main_controller` polls the database for pending commands, ensuring sequential and non-blocking execution.
 - **State Management**: Commands are updated to `IN_PROGRESS`, `COMPLETED`, or `FAILED`, providing a full audit trail.
 - **Auto-Slot Selection**: The `/order/process` endpoint can now automatically select a `RAW_DOUGH` cookie if no `source_slot` is specified.
 
 ### Synthetic Data Generation
+
 - **1-Month Historical Data**: The `scripts/generate_history.py` script populates the database with 30 days of realistic data.
 - **Breakdown Scenarios**:
   - **Day 12: Motor Failure**: `CONV_M1` current spikes to 4.5A and health degrades to 40%.
@@ -59,6 +61,7 @@ The system is built on a decoupled, event-driven architecture:
 - **Rich Data**: Includes order events, energy logs, motor health degradation, and predictive maintenance alerts.
 
 ### Enhanced Analytics Dashboard
+
 - **Real Database Integration**: Charts now pull historical data directly from the database.
 - **Breakdown Visualization**: Key charts now highlight the Day 12 motor failure and Day 25 sensor drift events.
 - **Motor Health View**: A dedicated tab for tracking motor health degradation over time and viewing current status.
@@ -68,10 +71,12 @@ The system is built on a decoupled, event-driven architecture:
 ## Quick Start
 
 ### Prerequisites
+
 - Python 3.9+ (3.11 recommended)
 - (Optional) MySQL 8.0+ or Docker for production use
 
 ### Installation
+
 ```bash
 git clone <repository-url> stf_project
 cd stf_project
@@ -82,7 +87,9 @@ pip install -r requirements.txt
 ```
 
 ### Configuration
+
 Create a `.env` file in the project root (optional - defaults to SQLite):
+
 ```env
 # Default: SQLite local database (no configuration needed)
 DATABASE_URL=sqlite:///./stf_digital_twin.db
@@ -97,18 +104,23 @@ MQTT_PORT=1883
 ```
 
 ### Generate Historical Data
+
 Run the synthetic data generator to populate the database:
+
 ```bash
 python scripts/generate_history.py --days 30 --orders-per-day 50
 ```
 
 ### Start Services
+
 **Option 1: Run script (Linux/macOS)**
+
 ```bash
 ./run_all.sh
 ```
 
 **Option 2: Manual startup (4 terminals)**
+
 ```bash
 # Terminal 1 - FastAPI Server
 uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -124,13 +136,15 @@ streamlit run dashboard/app.py
 ```
 
 ### Access Points
-| Service          | URL                             |
-| ---------------- | ------------------------------- |
-| Dashboard        | http://localhost:8501           |
-| Analytics        | http://localhost:8501/analytics |
-| API Docs         | http://localhost:8000/docs      |
+
+| Service   | URL                             |
+| --------- | ------------------------------- |
+| Dashboard | http://localhost:8501           |
+| Analytics | http://localhost:8501/analytics |
+| API Docs  | http://localhost:8000/docs      |
 
 ## Project Structure
+
 ```
 stf_project/
 ├── api/                    # FastAPI REST API + WebSocket
@@ -151,11 +165,12 @@ stf_project/
 ```
 
 ## API Endpoints (Updated)
-| Endpoint                        | Method | Description                                    |
-| ------------------------------- | ------ | ---------------------------------------------- |
-| `/commands/pending`             | GET    | Get pending commands for the controller        |
-| `/commands/{id}/status`         | POST   | Update the status of a command                 |
-| `/order/process`                | POST   | Queue a process command (auto-slot supported)  |
+
+| Endpoint                  | Method | Description                                   |
+| ------------------------- | ------ | --------------------------------------------- |
+| `/commands/pending`     | GET    | Get pending commands for the controller       |
+| `/commands/{id}/status` | POST   | Update the status of a command                |
+| `/order/process`        | POST   | Queue a process command (auto-slot supported) |
 
 (Other endpoints remain the same)
 

@@ -872,134 +872,360 @@ if data:
             </div>
             """, unsafe_allow_html=True)
     
-    # Robot Position Monitor
+    # 3D Robot Position Monitor
     with main_cols[1]:
-        st.markdown('<div class="section-title">Robot Position Monitor</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">3D Factory View</div>', unsafe_allow_html=True)
         
-        if hardware:
-            hw_df = pd.DataFrame([
-                {
-                    "Device": h["device_id"],
-                    "X": h["current_x"],
-                    "Y": h["current_y"],
-                    "Status": h["status"]
+        # ================================================================
+        # PHYSICAL LAYOUT (from hardware/mock_factory.py & database/models.py)
+        # 
+        # Storage Rack (vertical shelving unit):
+        #   - 3 columns (X: 100, 200, 300mm)
+        #   - 3 rows stacked vertically (Y: A=100 bottom, B=200 middle, C=300 top)
+        #   - Z=50 is the depth INTO the slot
+        #
+        # HBW Robot (in front of rack):
+        #   - X: Left/Right along rail (column selection)
+        #   - Y: Up/Down on tower (shelf height selection)
+        #   - Z: Fork extension horizontally INTO rack (NOT vertical!)
+        #
+        # Conveyor (right side of rack at X=400):
+        #   - Belt runs along local Z-axis (0-120mm belt length)
+        #   - Global position: X=400, Y=100, Z=25 (belt surface)
+        # ================================================================
+        
+        # Correct slot 3D coordinates - Rack is a vertical shelving unit
+        # Viewed from front: X=left/right, Y=up/down, Z=depth into rack
+        SLOT_COORDS_3D = {
+            # Row A (BOTTOM shelf, Y=100)
+            "A1": (100, 100, 0), "A2": (200, 100, 0), "A3": (300, 100, 0),
+            # Row B (MIDDLE shelf, Y=200)
+            "B1": (100, 200, 0), "B2": (200, 200, 0), "B3": (300, 200, 0),
+            # Row C (TOP shelf, Y=300)
+            "C1": (100, 300, 0), "C2": (200, 300, 0), "C3": (300, 300, 0),
+        }
+        
+        # Slot dimensions (mm)
+        SLOT_WIDTH = 60   # X direction
+        SLOT_HEIGHT = 60  # Y direction
+        SLOT_DEPTH = 50   # Z direction (into rack)
+        
+        # HBW positions
+        REST_POSITION = (400, 90, 10)      # Home position (in front of conveyor)
+        CONVEYOR_POSITION = (400, 100, 25)  # Conveyor handoff
+        
+        fig = go.Figure()
+        
+        # --- Storage Rack Back Panel ---
+        # The rack is a vertical structure with slots
+        rack_back_z = -10  # Back of rack
+        
+        # Rack frame (wireframe box)
+        fig.add_trace(go.Mesh3d(
+            x=[50, 350, 350, 50, 50, 350, 350, 50],
+            y=[50, 50, 350, 350, 50, 50, 350, 350],
+            z=[rack_back_z, rack_back_z, rack_back_z, rack_back_z, 60, 60, 60, 60],
+            i=[0, 0, 4, 4, 0, 1],
+            j=[1, 2, 5, 6, 4, 5],
+            k=[2, 3, 6, 7, 1, 2],
+            color='rgba(60, 70, 90, 0.3)',
+            opacity=0.2,
+            name='Rack Structure',
+            hoverinfo='skip',
+            showlegend=False,
+        ))
+        
+        # --- Storage Slots (3D boxes representing shelf compartments) ---
+        for slot_name, (sx, sy, sz) in SLOT_COORDS_3D.items():
+            slot_data = next((s for s in inventory if s["slot_name"] == slot_name), None)
+            has_cookie = slot_data and slot_data.get("carrier_id")
+            cookie_flavor = slot_data.get("cookie_flavor", "") if slot_data else ""
+            cookie_status = slot_data.get("cookie_status", "") if slot_data else ""
+            
+            # Slot compartment (as a 3D box)
+            x0, x1 = sx - SLOT_WIDTH/2, sx + SLOT_WIDTH/2
+            y0, y1 = sy - SLOT_HEIGHT/2, sy + SLOT_HEIGHT/2
+            z0, z1 = rack_back_z, sz + SLOT_DEPTH
+            
+            # Color based on content
+            if has_cookie:
+                flavor_colors = {
+                    "CHOCO": 'rgba(139, 90, 43, 0.8)',
+                    "VANILLA": 'rgba(255, 250, 205, 0.8)',
+                    "STRAWBERRY": 'rgba(255, 105, 180, 0.8)',
                 }
-                for h in hardware
-            ])
-            
-            color_map = {
-                "IDLE": "#00ff88",
-                "MOVING": "#ffa502",
-                "ERROR": "#ff4757",
-                "MAINTENANCE": "#70a1ff"
-            }
-            
-            fig = go.Figure()
-            
-            # Add grid lines for slots
-            for slot in inventory:
-                fig.add_shape(
-                    type="rect",
-                    x0=slot["x_pos"] - 40, y0=slot["y_pos"] - 40,
-                    x1=slot["x_pos"] + 40, y1=slot["y_pos"] + 40,
-                    line=dict(color="rgba(255,255,255,0.1)", width=1),
-                    fillcolor="rgba(255,255,255,0.02)"
-                )
-                fig.add_annotation(
-                    x=slot["x_pos"], y=slot["y_pos"],
-                    text=slot["slot_name"],
-                    showarrow=False,
-                    font=dict(color="rgba(255,255,255,0.3)", size=10)
-                )
-            
-            # Add robot markers
-            for _, row in hw_df.iterrows():
-                fig.add_trace(go.Scatter(
-                    x=[row["X"]],
-                    y=[row["Y"]],
-                    mode="markers+text",
-                    marker=dict(
-                        size=20,
-                        color=color_map.get(row["Status"], "#70a1ff"),
-                        symbol="diamond",
-                        line=dict(color="white", width=2)
-                    ),
-                    text=[row["Device"]],
-                    textposition="top center",
-                    textfont=dict(color="white", size=11),
-                    name=row["Device"],
-                    hovertemplate=f"<b>{row['Device']}</b><br>X: {row['X']}<br>Y: {row['Y']}<br>Status: {row['Status']}<extra></extra>"
+                slot_color = flavor_colors.get(cookie_flavor, 'rgba(200, 180, 140, 0.8)')
+                # Cookie/carrier inside slot
+                fig.add_trace(go.Mesh3d(
+                    x=[x0+5, x1-5, x1-5, x0+5, x0+5, x1-5, x1-5, x0+5],
+                    y=[y0+5, y0+5, y1-5, y1-5, y0+5, y0+5, y1-5, y1-5],
+                    z=[5, 5, 5, 5, 35, 35, 35, 35],
+                    i=[0, 0, 4, 4, 0, 1, 2, 3, 0, 1, 2, 3],
+                    j=[1, 2, 5, 6, 4, 5, 6, 7, 1, 2, 3, 0],
+                    k=[2, 3, 6, 7, 1, 2, 3, 4, 4, 5, 6, 7],
+                    color=slot_color,
+                    opacity=0.9,
+                    name=f'{slot_name}: {cookie_flavor}',
+                    hovertemplate=f"<b>{slot_name}</b><br>{cookie_flavor}<br>Status: {cookie_status}<extra></extra>",
+                    showlegend=False,
                 ))
             
-            # Add zones for conveyor, oven, and pickup
-            zones = [
-                {"name": "PICKUP", "x": 25, "y": 25, "color": "rgba(0, 255, 136, 0.1)"},
-                {"name": "CONVEYOR", "x": 350, "y": 200, "color": "rgba(255, 165, 2, 0.1)"},
-                {"name": "OVEN", "x": 350, "y": 100, "color": "rgba(255, 71, 87, 0.1)"},
-            ]
+            # Slot frame outline
+            frame_color = 'rgba(100, 255, 150, 0.6)' if has_cookie else 'rgba(100, 100, 120, 0.4)'
+            # Bottom face outline
+            fig.add_trace(go.Scatter3d(
+                x=[x0, x1, x1, x0, x0],
+                y=[y0, y0, y1, y1, y0],
+                z=[z1, z1, z1, z1, z1],
+                mode='lines',
+                line=dict(color=frame_color, width=2),
+                showlegend=False,
+                hoverinfo='skip',
+            ))
             
-            for zone in zones:
-                fig.add_shape(
-                    type="rect",
-                    x0=zone["x"] - 30, y0=zone["y"] - 30,
-                    x1=zone["x"] + 30, y1=zone["y"] + 30,
-                    line=dict(color="rgba(255,255,255,0.2)", width=2, dash="dash"),
-                    fillcolor=zone["color"]
-                )
-                fig.add_annotation(
-                    x=zone["x"], y=zone["y"] - 45,
-                    text=zone["name"],
-                    showarrow=False,
-                    font=dict(color="rgba(255,255,255,0.5)", size=9)
-                )
-            
-            fig.update_layout(
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
+            # Slot label
+            fig.add_trace(go.Scatter3d(
+                x=[sx], y=[sy], z=[z1 + 5],
+                mode='text',
+                text=[slot_name],
+                textfont=dict(color='rgba(255,255,255,0.9)', size=11),
+                showlegend=False,
+                hovertemplate=f"<b>{slot_name}</b><br>X: {sx}mm<br>Y: {sy}mm<br>" +
+                              (f"Cookie: {cookie_flavor}<br>Status: {cookie_status}" if has_cookie else "Empty") +
+                              "<extra></extra>",
+            ))
+        
+        # --- Conveyor Belt (on the right side) ---
+        # Belt runs along Z-axis at X=400, Y=100
+        conv_x = 400
+        conv_y = 100
+        conv_z_start = 0    # VGR end
+        conv_z_end = 120    # HBW end
+        belt_width = 40
+        belt_height = 25
+        
+        # Conveyor body
+        fig.add_trace(go.Mesh3d(
+            x=[conv_x - belt_width/2, conv_x + belt_width/2, conv_x + belt_width/2, conv_x - belt_width/2,
+               conv_x - belt_width/2, conv_x + belt_width/2, conv_x + belt_width/2, conv_x - belt_width/2],
+            y=[conv_y - 30, conv_y - 30, conv_y + 30, conv_y + 30,
+               conv_y - 30, conv_y - 30, conv_y + 30, conv_y + 30],
+            z=[conv_z_start, conv_z_start, conv_z_start, conv_z_start,
+               belt_height, belt_height, belt_height, belt_height],
+            i=[0, 0, 4, 4, 0, 1, 2, 3, 0, 1, 2, 3],
+            j=[1, 2, 5, 6, 4, 5, 6, 7, 1, 2, 3, 0],
+            k=[2, 3, 6, 7, 1, 2, 3, 4, 4, 5, 6, 7],
+            color='rgba(255, 165, 2, 0.6)',
+            opacity=0.7,
+            name='Conveyor Belt',
+            hovertemplate="<b>CONVEYOR</b><br>Belt Surface<br>X: 400mm<br>Length: 120mm<extra></extra>",
+        ))
+        
+        # Belt surface (top)
+        fig.add_trace(go.Scatter3d(
+            x=[conv_x - belt_width/2, conv_x + belt_width/2, conv_x + belt_width/2, conv_x - belt_width/2, conv_x - belt_width/2],
+            y=[conv_y - 30, conv_y - 30, conv_y + 30, conv_y + 30, conv_y - 30],
+            z=[belt_height, belt_height, belt_height, belt_height, belt_height],
+            mode='lines',
+            line=dict(color='#ffa502', width=3),
+            showlegend=False,
+            hoverinfo='skip',
+        ))
+        
+        # Conveyor direction arrow (showing belt direction)
+        fig.add_trace(go.Cone(
+            x=[conv_x], y=[conv_y + 40], z=[belt_height + 5],
+            u=[0], v=[-20], w=[0],
+            colorscale=[[0, '#ffa502'], [1, '#ffa502']],
+            showscale=False,
+            sizemode='absolute',
+            sizeref=10,
+            name='Belt Direction',
+            hovertemplate="Belt moves toward rack<extra></extra>",
+        ))
+        
+        # --- HBW Robot ---
+        status_colors = {
+            "IDLE": "#00ff88",
+            "MOVING": "#ffa502",
+            "ERROR": "#ff4757",
+            "MAINTENANCE": "#70a1ff"
+        }
+        
+        if hardware:
+            for hw in hardware:
+                device_id = hw["device_id"]
+                x = hw["current_x"]
+                y = hw["current_y"]
+                z = hw["current_z"]
+                status = hw["status"]
+                
+                if "HBW" in device_id:
+                    # Use REST position if at origin
+                    if x == 0 and y == 0 and z == 0:
+                        x, y, z = REST_POSITION
+                    
+                    robot_color = status_colors.get(status, "#70a1ff")
+                    
+                    # HBW is in front of rack, Z represents fork extension INTO rack
+                    # Draw HBW carriage (main body)
+                    hbw_z_pos = 60 + z  # Base Z position + fork extension
+                    
+                    # Robot carriage (box)
+                    carriage_size = 30
+                    fig.add_trace(go.Mesh3d(
+                        x=[x - carriage_size/2, x + carriage_size/2, x + carriage_size/2, x - carriage_size/2,
+                           x - carriage_size/2, x + carriage_size/2, x + carriage_size/2, x - carriage_size/2],
+                        y=[y - carriage_size/2, y - carriage_size/2, y + carriage_size/2, y + carriage_size/2,
+                           y - carriage_size/2, y - carriage_size/2, y + carriage_size/2, y + carriage_size/2],
+                        z=[hbw_z_pos - 15, hbw_z_pos - 15, hbw_z_pos - 15, hbw_z_pos - 15,
+                           hbw_z_pos + 15, hbw_z_pos + 15, hbw_z_pos + 15, hbw_z_pos + 15],
+                        i=[0, 0, 4, 4, 0, 1, 2, 3, 0, 1, 2, 3],
+                        j=[1, 2, 5, 6, 4, 5, 6, 7, 1, 2, 3, 0],
+                        k=[2, 3, 6, 7, 1, 2, 3, 4, 4, 5, 6, 7],
+                        color=robot_color,
+                        opacity=0.9,
+                        name=device_id,
+                        hovertemplate=f"<b>{device_id}</b><br>X: {x:.0f}mm (column)<br>Y: {y:.0f}mm (height)<br>Z: {z:.0f}mm (fork)<br>Status: {status}<extra></extra>",
+                    ))
+                    
+                    # Fork extension (horizontal bar extending toward rack)
+                    if z > 10:
+                        fork_length = z - 10
+                        fig.add_trace(go.Scatter3d(
+                            x=[x, x],
+                            y=[y, y],
+                            z=[hbw_z_pos, hbw_z_pos - fork_length],
+                            mode='lines',
+                            line=dict(color=robot_color, width=8),
+                            showlegend=False,
+                            hoverinfo='skip',
+                        ))
+                    
+                    # Vertical guide rail (tower)
+                    fig.add_trace(go.Scatter3d(
+                        x=[x, x],
+                        y=[0, 400],
+                        z=[70, 70],
+                        mode='lines',
+                        line=dict(color='rgba(100,100,120,0.5)', width=4),
+                        showlegend=False,
+                        hoverinfo='skip',
+                    ))
+                    
+                elif "VGR" in device_id:
+                    # VGR operates at conveyor input side
+                    if x == 0 and y == 0 and z == 0:
+                        x, y, z = (400, 150, 50)
+                    
+                    fig.add_trace(go.Scatter3d(
+                        x=[x], y=[y], z=[z + 60],
+                        mode='markers+text',
+                        marker=dict(size=12, color=status_colors.get(status, "#70a1ff"), symbol='cross'),
+                        text=[device_id],
+                        textposition='top center',
+                        textfont=dict(color='white', size=10),
+                        name=device_id,
+                        hovertemplate=f"<b>{device_id}</b><br>X: {x:.0f}mm<br>Y: {y:.0f}mm<br>Z: {z:.0f}mm<br>Status: {status}<extra></extra>",
+                    ))
+                    
+                elif "CONVEYOR" in device_id:
+                    # Conveyor motor indicator
+                    fig.add_trace(go.Scatter3d(
+                        x=[conv_x], y=[conv_y], z=[belt_height + 10],
+                        mode='markers',
+                        marker=dict(size=8, color=status_colors.get(status, "#ffa502"), symbol='circle'),
+                        name='Conv Motor',
+                        hovertemplate=f"<b>Conveyor Motor</b><br>Status: {status}<extra></extra>",
+                        showlegend=False,
+                    ))
+        
+        # --- Floor Grid ---
+        for i in range(0, 500, 100):
+            fig.add_trace(go.Scatter3d(
+                x=[i, i], y=[0, 400], z=[0, 0],
+                mode='lines', line=dict(color='rgba(255,255,255,0.1)', width=1),
+                showlegend=False, hoverinfo='skip',
+            ))
+            fig.add_trace(go.Scatter3d(
+                x=[0, 450], y=[i, i], z=[0, 0],
+                mode='lines', line=dict(color='rgba(255,255,255,0.1)', width=1),
+                showlegend=False, hoverinfo='skip',
+            ))
+        
+        # --- Layout Configuration ---
+        fig.update_layout(
+            scene=dict(
                 xaxis=dict(
-                    range=[-20, 420],
-                    showgrid=True,
-                    gridcolor="rgba(255,255,255,0.05)",
-                    zeroline=False,
-                    color="rgba(255,255,255,0.5)",
-                    title=dict(text="X Position (mm)", font=dict(size=10, color="rgba(255,255,255,0.4)")),
-                    tickfont=dict(size=9, color="rgba(255,255,255,0.4)"),
-                    dtick=100,
-                    fixedrange=False  # Allow zooming on X axis
+                    title=dict(text='X - Column (mm)', font=dict(color='rgba(255,255,255,0.6)', size=10)),
+                    range=[0, 500],
+                    backgroundcolor='rgba(0,0,0,0)',
+                    gridcolor='rgba(255,255,255,0.1)',
+                    showbackground=True,
+                    tickfont=dict(color='rgba(255,255,255,0.5)', size=9),
                 ),
                 yaxis=dict(
-                    range=[-20, 420],
-                    showgrid=True,
-                    gridcolor="rgba(255,255,255,0.05)",
-                    zeroline=False,
-                    color="rgba(255,255,255,0.5)",
-                    title=dict(text="Y Position (mm)", font=dict(size=10, color="rgba(255,255,255,0.4)")),
-                    tickfont=dict(size=9, color="rgba(255,255,255,0.4)"),
-                    dtick=100,
-                    fixedrange=False  # Allow zooming on Y axis
+                    title=dict(text='Y - Height (mm)', font=dict(color='rgba(255,255,255,0.6)', size=10)),
+                    range=[0, 400],
+                    backgroundcolor='rgba(0,0,0,0)',
+                    gridcolor='rgba(255,255,255,0.1)',
+                    showbackground=True,
+                    tickfont=dict(color='rgba(255,255,255,0.5)', size=9),
                 ),
-                showlegend=False,
-                margin=dict(l=50, r=20, t=20, b=50),
-                height=350,
-                dragmode="pan",  # Enable pan mode for moving around
-                hovermode="closest"
-            )
-            
-            # Enable interactive features including zoom, pan, and selection
-            st.plotly_chart(
-                fig, 
-                use_container_width=True, 
-                config={
-                    "displayModeBar": True,
-                    "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"],
-                    "modeBarButtonsToAdd": ["drawopenpath", "eraseshape"],
-                    "displaylogo": False,
-                    "scrollZoom": True,  # Enable scroll to zoom
-                    "doubleClick": "reset",  # Double-click to reset view
-                }
-            )
-        else:
-            st.info("No hardware data available")
+                zaxis=dict(
+                    title=dict(text='Z - Depth (mm)', font=dict(color='rgba(255,255,255,0.6)', size=10)),
+                    range=[-20, 150],
+                    backgroundcolor='rgba(0,0,0,0)',
+                    gridcolor='rgba(255,255,255,0.1)',
+                    showbackground=True,
+                    tickfont=dict(color='rgba(255,255,255,0.5)', size=9),
+                ),
+                bgcolor='rgba(10,10,26,0.8)',
+                camera=dict(
+                    eye=dict(x=1.8, y=0.8, z=1.0),  # View from front-right
+                    center=dict(x=0, y=0, z=0),
+                ),
+                aspectmode='manual',
+                aspectratio=dict(x=1.2, y=1, z=0.5),
+            ),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=0, r=0, t=30, b=0),
+            height=450,
+            showlegend=True,
+            legend=dict(
+                x=0.02, y=0.98,
+                bgcolor='rgba(0,0,0,0.5)',
+                bordercolor='rgba(255,255,255,0.2)',
+                borderwidth=1,
+                font=dict(color='white', size=10),
+            ),
+        )
+        
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+                "displaylogo": False,
+                "scrollZoom": True,
+            }
+        )
+        
+        # Position info below chart
+        if hardware:
+            hw_hbw = next((h for h in hardware if "HBW" in h["device_id"]), None)
+            if hw_hbw:
+                x, y, z = hw_hbw["current_x"], hw_hbw["current_y"], hw_hbw["current_z"]
+                if x == 0 and y == 0 and z == 0:
+                    x, y, z = REST_POSITION
+                st.markdown(f"""
+                <div style="text-align: center; color: rgba(255,255,255,0.6); font-size: 11px; margin-top: 8px;">
+                    <span style="color: #00ff88;">●</span> HBW: 
+                    <strong>X={x:.0f}</strong> (col) | <strong>Y={y:.0f}</strong> (height) | <strong>Z={z:.0f}</strong> (fork) mm
+                </div>
+                """, unsafe_allow_html=True)
     
     # Inventory Grid
     with main_cols[2]:

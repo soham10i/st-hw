@@ -263,17 +263,66 @@ class SensorSimulation:
 
 class ConveyorSimulation:
     """
-    Simulates the conveyor belt with motor and dual sensor systems:
-    - Light Barriers (Lichtschranke): I_2 inner, I_3 outer - for presence detection
-    - Trail Sensors (Spursensor): I_5 bottom, I_6 top - for track position
+    Simulates the Conveyor Belt - the bridge between VGR and HBW.
+    
+    Physical Description:
+    - A motorized belt that transports items between the two robots
+    - VGR operates at the INPUT end (places items)
+    - HBW operates at the OUTPUT end (picks up items)
+    - The robots NEVER interact directly - only through this conveyor
+    
+    Sensor Systems:
+    - Light Barriers (Lichtschranke): I_2 inner, I_3 outer - presence detection
+    - Trail Sensors (Spursensor): I_5 bottom, I_6 top - track position
+    
+    The Handshake Flow:
+    ┌─────────┐                        ┌─────────┐
+    │   VGR   │  ──places item──>  ──> │   HBW   │
+    │ (Input) │     0mm      BELT      │(Output) │
+    │  Side   │              120mm     │  Side   │
+    └─────────┘                        └─────────┘
+    
+    Global Factory Coordinates:
+    - Origin (0,0) is at LEFT of storage rack
+    - Storage slots: X=100-300mm, Y=100-300mm  
+    - Conveyor is at global position ~(400, 100, 25)
+    - VGR drops items at one end, HBW picks from other end
+    
+    Direction: 
+    - Forward (1): VGR side → HBW side (normal operation)
+    - Reverse (-1): HBW side → VGR side (for retrieval)
+    
+    Sensor-Based Positioning (no encoder):
+    - The conveyor does NOT use encoder positioning
+    - Position is determined by Light Barriers (I2, I3) and Trail Sensors (I5, I6)
+    - I2 (Inner/HBW side): Triggers when object is at HBW interface (~105mm)
+    - I3 (Outer/VGR side): Triggers when object is at VGR interface (~15mm)
+    - I5/I6 (Trail): Toggle every 5mm of belt movement to prove motion
+    
+    Belt Length: ~120mm (realistic Fischertechnik conveyor ~12cm)
     """
+    
+    # Conveyor endpoints (mm)
+    VGR_INPUT_POSITION = 0.0      # Where VGR drops items (local belt coordinate)
+    HBW_OUTPUT_POSITION = 120.0   # Where HBW picks up items (local belt coordinate)
+    BELT_LENGTH_MM = 120.0        # Total belt length (~12cm Fischertechnik conveyor)
+    
+    # ============================================
+    # SENSOR-BASED POSITION CONSTANTS
+    # Local belt coordinates (0 = VGR end, 120 = HBW end)
+    # Maps to global factory position ~(400, 100, 25)
+    # ============================================
+    POS_HBW_INTERFACE = 105.0     # HBW pickup position (I2 triggers here)
+    POS_VGR_INTERFACE = 15.0      # VGR dropoff position (I3 triggers here)
+    SENSOR_TOLERANCE_MM = 10.0    # ±10mm trigger zone for light barriers
+    TRAIL_RIB_SPACING_MM = 5.0    # Trail sensors toggle every 5mm
     
     def __init__(self):
         self.belt_position_mm: float = 0.0
-        self.object_position_mm: float = 0.0  # Cookie/object position on belt
-        self.belt_length_mm: float = 1000.0
-        self.direction: int = 1  # 1 = forward, -1 = reverse
-        self.has_object: bool = False  # Whether an object is on the belt
+        self.object_position_mm: float = 0.0  # Cookie/carrier position on belt
+        self.belt_length_mm: float = self.BELT_LENGTH_MM  # 120mm
+        self.direction: int = 1  # 1 = forward (VGR→HBW), -1 = reverse (HBW→VGR)
+        self.has_object: bool = False  # Whether an item is on the belt
         
         # Motor
         self.motor = MotorSimulation(
@@ -288,28 +337,45 @@ class ConveyorSimulation:
         
         # ============================================
         # LIGHT BARRIERS (Lichtschranke) - I_2, I_3
-        # Through-beam sensors at entry/exit points
+        # Through-beam sensors at HBW and VGR interface points
+        # Trigger zone: ±10mm of interface position
         # ============================================
         self.light_barriers = {
-            "I2": LightBarrierSimulation("CONV_LB_I2", 0, 100),      # Inner: 0-100mm (entry)
-            "I3": LightBarrierSimulation("CONV_LB_I3", 900, 1000),   # Outer: 900-1000mm (exit)
+            # I2 (Inner/HBW side): Triggers at POS_HBW_INTERFACE ±10mm (95-115mm)
+            "I2": LightBarrierSimulation(
+                "CONV_LB_I2", 
+                self.POS_HBW_INTERFACE - self.SENSOR_TOLERANCE_MM,  # 95mm
+                self.POS_HBW_INTERFACE + self.SENSOR_TOLERANCE_MM   # 115mm
+            ),
+            # I3 (Outer/VGR side): Triggers at POS_VGR_INTERFACE ±10mm (5-25mm)
+            "I3": LightBarrierSimulation(
+                "CONV_LB_I3", 
+                self.POS_VGR_INTERFACE - self.SENSOR_TOLERANCE_MM,  # 5mm
+                self.POS_VGR_INTERFACE + self.SENSOR_TOLERANCE_MM   # 25mm
+            ),
         }
         
         # ============================================
         # TRAIL SENSORS (Spursensor) - I_5, I_6
-        # Reflective sensors for track following
+        # Simulates "rib detection" - toggles every 5mm of movement
+        # I5 and I6 alternate states to prove physical movement
         # ============================================
         self.trail_sensors = {
-            "I5": TrailSensorSimulation("CONV_TS_I5", track_center_mm=500, track_width_mm=50),  # Bottom sensor
-            "I6": TrailSensorSimulation("CONV_TS_I6", track_center_mm=500, track_width_mm=50),  # Top sensor
+            "I5": TrailSensorSimulation("CONV_TS_I5", track_center_mm=60, track_width_mm=20),  # Bottom sensor
+            "I6": TrailSensorSimulation("CONV_TS_I6", track_center_mm=60, track_width_mm=20),  # Top sensor
         }
         
+        # Trail sensor state for rib detection simulation
+        self._last_rib_position_mm = 0.0  # Track when we last toggled
+        self._trail_toggle_state = False   # Current toggle state (I5=state, I6=!state)
+        
         # Legacy light barrier zones (for backward compatibility with dashboard L1-L4)
+        # Scaled to 120mm belt length
         self.sensors = {
-            "L1": SensorSimulation("CONV_L1_ENTRY", 0, 50),      # Entry: 0-50mm
-            "L2": SensorSimulation("CONV_L2_PROCESS", 300, 350), # Process: 300-350mm
-            "L3": SensorSimulation("CONV_L3_EXIT", 600, 650),    # Exit: 600-650mm
-            "L4": SensorSimulation("CONV_L4_OVERFLOW", 950, 1000), # Overflow: 950-1000mm
+            "L1": SensorSimulation("CONV_L1_ENTRY", 0, 15),       # Entry: 0-15mm
+            "L2": SensorSimulation("CONV_L2_PROCESS", 40, 50),   # Process: 40-50mm
+            "L3": SensorSimulation("CONV_L3_EXIT", 70, 80),      # Exit: 70-80mm
+            "L4": SensorSimulation("CONV_L4_OVERFLOW", 105, 120), # Overflow: 105-120mm
         }
     
     def place_object(self, position_mm: float = 0.0):
@@ -331,10 +397,74 @@ class ConveyorSimulation:
         """Stop conveyor"""
         self.motor.deactivate()
     
+    # =========================================================================
+    # SENSOR-BASED POSITION METHODS
+    # =========================================================================
+    
+    def is_at_hbw_interface(self) -> bool:
+        """
+        Check if object is at HBW interface position (ready for pickup).
+        
+        Returns
+        -------
+        bool
+            True if object is within ±25mm of POS_HBW_INTERFACE (400mm).
+        """
+        if not self.has_object:
+            return False
+        return abs(self.object_position_mm - self.POS_HBW_INTERFACE) <= self.SENSOR_TOLERANCE_MM
+    
+    def is_at_vgr_interface(self) -> bool:
+        """
+        Check if object is at VGR interface position (ready for dropoff).
+        
+        Returns
+        -------
+        bool
+            True if object is within ±25mm of POS_VGR_INTERFACE (950mm).
+        """
+        if not self.has_object:
+            return False
+        return abs(self.object_position_mm - self.POS_VGR_INTERFACE) <= self.SENSOR_TOLERANCE_MM
+    
+    def get_sensor_states(self) -> Dict[str, bool]:
+        """
+        Get current state of all position-relevant sensors.
+        
+        Returns
+        -------
+        Dict[str, bool]
+            Dictionary with sensor IDs and their triggered states:
+            - I2: True when object at HBW interface
+            - I3: True when object at VGR interface
+            - I5/I6: Trail sensor states (alternating for motion proof)
+        """
+        return {
+            "I2": self.is_at_hbw_interface(),
+            "I3": self.is_at_vgr_interface(),
+            "I5": self._trail_toggle_state,
+            "I6": not self._trail_toggle_state,
+        }
+
     def tick(self, dt: float) -> Dict:
-        """Update conveyor state for one tick"""
+        """
+        Update conveyor state for one tick with sensor-based positioning.
+        
+        Sensor Logic:
+        - I2 (Inner/HBW): True when object is at POS_HBW_INTERFACE ±25mm (375-425mm)
+        - I3 (Outer/VGR): True when object is at POS_VGR_INTERFACE ±25mm (925-975mm)
+        - I5/I6 (Trail): Toggle every 10mm of belt movement (rib detection)
+        
+        Returns
+        -------
+        Dict
+            Complete conveyor state including all sensor readings.
+        """
         # Update motor
         motor_state = self.motor.tick(dt)
+        
+        # Track movement for trail sensors
+        movement = 0.0
         
         # Update belt position based on motor velocity
         if self.motor.velocity > 0:
@@ -356,18 +486,42 @@ class ConveyorSimulation:
                 self.has_object = False
         
         # ============================================
-        # Update Light Barriers (Lichtschranke)
+        # SENSOR-BASED POSITIONING LOGIC
         # ============================================
+        
+        # --- Light Barriers (I2, I3) ---
+        # I2 triggers when object is within ±25mm of HBW interface (400mm)
+        # I3 triggers when object is within ±25mm of VGR interface (950mm)
         light_barrier_states = {}
         for key, lb in self.light_barriers.items():
             light_barrier_states[key] = lb.update(self.object_position_mm, self.has_object)
         
-        # ============================================
-        # Update Trail Sensors (Spursensor)
-        # ============================================
-        trail_sensor_states = {}
-        for key, ts in self.trail_sensors.items():
-            trail_sensor_states[key] = ts.update(self.object_position_mm, self.belt_position_mm)
+        # --- Trail Sensors (I5, I6) - Rib Detection ---
+        # Toggle every TRAIL_RIB_SPACING_MM (10mm) of belt movement
+        # I5 and I6 alternate states to prove physical movement
+        if abs(self.belt_position_mm - self._last_rib_position_mm) >= self.TRAIL_RIB_SPACING_MM:
+            self._trail_toggle_state = not self._trail_toggle_state
+            self._last_rib_position_mm = self.belt_position_mm
+        
+        # Override trail sensor states with rib detection simulation
+        trail_sensor_states = {
+            "I5": {
+                "component_id": self.trail_sensors["I5"].component_id,
+                "sensor_type": "TRAIL_SENSOR",
+                "is_triggered": self._trail_toggle_state,
+                "trigger_count": int(self.belt_position_mm / self.TRAIL_RIB_SPACING_MM),
+                "reflectance_value": 0.9 if self._trail_toggle_state else 0.1,
+                "track_position": "CENTER" if self._trail_toggle_state else "LOST",
+            },
+            "I6": {
+                "component_id": self.trail_sensors["I6"].component_id,
+                "sensor_type": "TRAIL_SENSOR",
+                "is_triggered": not self._trail_toggle_state,  # Alternates with I5
+                "trigger_count": int(self.belt_position_mm / self.TRAIL_RIB_SPACING_MM),
+                "reflectance_value": 0.1 if self._trail_toggle_state else 0.9,
+                "track_position": "LOST" if self._trail_toggle_state else "CENTER",
+            },
+        }
         
         # Update legacy sensors (L1-L4) for backward compatibility
         legacy_sensor_states = {}
@@ -381,38 +535,106 @@ class ConveyorSimulation:
             "belt_position_pct": round(self.belt_position_mm / 10, 1),
             "direction": self.direction,
             "motor": motor_state,
-            # New sensor systems
+            # New sensor systems with sensor-based positioning
             "light_barriers": light_barrier_states,  # Lichtschranke (I_2, I_3)
-            "trail_sensors": trail_sensor_states,    # Spursensor (I_5, I_6)
+            "trail_sensors": trail_sensor_states,    # Spursensor (I_5, I_6) with rib detection
             # Legacy for backward compatibility
             "sensors": legacy_sensor_states,
+            # Convenience flags for controller logic
+            "at_hbw_interface": light_barrier_states["I2"]["is_triggered"],
+            "at_vgr_interface": light_barrier_states["I3"]["is_triggered"],
         }
 
 
 class HBWSimulation:
-    """Simulates the High-Bay Warehouse (Cantilever) robot"""
+    """
+    Simulates the High-Bay Warehouse (HBW) - Automated Stacker Crane.
+    
+    Physical Description:
+    - Located INSIDE the warehouse rack structure
+    - Uses a MECHANICAL FORK (Cantilever) to lift carriers from below
+    - The fork slides under the carrier, then lifts it
+    
+    Coordinate System (separate from VGR):
+    - X-axis: Horizontal movement LEFT/RIGHT along the rail (selects column)
+    - Y-axis: Vertical movement UP/DOWN along the tower (selects shelf height)
+    - Z-axis: HORIZONTAL telescoping IN/OUT to reach into rack slots
+             (NOT vertical - this extends the fork into the storage bay)
+    
+    Storage Rack Layout (9 slots in 3x3 grid):
+        Column:   1       2       3
+        Row A:   A1      A2      A3    (Top shelf)
+        Row B:   B1      B2      B3    (Middle shelf)
+        Row C:   C1      C2      C3    (Bottom shelf)
+    
+    Conveyor Interface:
+    - Picks up carriers from the OUTPUT side of the conveyor belt
+    - Places carriers into storage slots A1-C3
+    """
+    
+    # Storage slot coordinates (mm) - maps slot names to (x, y) positions
+    # Z is always 0 (retracted) when not actively picking/placing
+    SLOT_COORDINATES = {
+        "A1": (0, 200),    "A2": (100, 200),   "A3": (200, 200),   # Top row
+        "B1": (0, 100),    "B2": (100, 100),   "B3": (200, 100),   # Middle row
+        "C1": (0, 0),      "C2": (100, 0),     "C3": (200, 0),     # Bottom row
+    }
+    
+    # Conveyor pickup position (where HBW meets the conveyor output)
+    CONVEYOR_PICKUP = (100, 0, 0)  # x, y, z - at conveyor level
+    
+    # Fork extension distance into rack slot
+    FORK_EXTENSION_MM = 80.0
     
     def __init__(self):
-        # Position state
-        self.x: float = 0.0
-        self.y: float = 0.0
-        self.z: float = 0.0
+        # Position state (HBW's own coordinate system)
+        self.x: float = 0.0   # Left/Right along rail
+        self.y: float = 0.0   # Up/Down on tower
+        self.z: float = 0.0   # Fork extension In/Out (horizontal)
         
         self.target_x: Optional[float] = None
         self.target_y: Optional[float] = None
         self.target_z: Optional[float] = None
         
-        # Motors
+        # Motors (3 axes for stacker crane)
         self.motors = {
-            "X": MotorSimulation("HBW_X", ElectricalModel(running_amps=1.5)),
-            "Y": MotorSimulation("HBW_Y", ElectricalModel(running_amps=1.5)),
-            "Z": MotorSimulation("HBW_Z", ElectricalModel(running_amps=1.0)),
+            "X": MotorSimulation("HBW_X", ElectricalModel(running_amps=1.5)),  # Horizontal travel
+            "Y": MotorSimulation("HBW_Y", ElectricalModel(running_amps=1.5)),  # Vertical lift
+            "Z": MotorSimulation("HBW_Z", ElectricalModel(running_amps=1.0)),  # Fork telescope
         }
         
-        # Reference switch
+        # Reference switch (home position sensor)
         self.ref_switch_triggered = False
         
-        # Gripper state
+        # Fork/Cantilever state (mechanical gripper)
+        # True = fork extended and engaged under carrier
+        # False = fork retracted
+        self.gripper_closed = False
+        self.has_carrier = False  # Whether a carrier is on the fork
+    
+    def move_to_slot(self, slot: str):
+        """Move HBW to a storage slot position (A1-C3)"""
+        if slot in self.SLOT_COORDINATES:
+            x, y = self.SLOT_COORDINATES[slot]
+            self.move_to(x, y, 0)  # Z=0 initially, extend fork separately
+            return True
+        return False
+    
+    def move_to_conveyor(self):
+        """Move HBW to the conveyor pickup position"""
+        x, y, z = self.CONVEYOR_PICKUP
+        self.move_to(x, y, z)
+    
+    def extend_fork(self):
+        """Extend the fork into the rack slot (Z-axis movement)"""
+        self.target_z = self.FORK_EXTENSION_MM
+        self.motors["Z"].activate()
+        self.gripper_closed = True
+    
+    def retract_fork(self):
+        """Retract the fork back (Z-axis to 0)"""
+        self.target_z = 0
+        self.motors["Z"].activate()
         self.gripper_closed = False
     
     def move_to(self, x: float, y: float, z: float):
@@ -485,46 +707,110 @@ class HBWSimulation:
         
         return {
             "device_id": "HBW",
-            "x": round(self.x, 1),
-            "y": round(self.y, 1),
-            "z": round(self.z, 1),
+            "x": round(self.x, 1),              # Position on rail (Left/Right)
+            "y": round(self.y, 1),              # Position on tower (Up/Down)
+            "z": round(self.z, 1),              # Fork extension (In/Out - horizontal!)
             "status": status,
             "motors": motor_states,
             "ref_switch": self.ref_switch_triggered,
-            "gripper_closed": self.gripper_closed,
+            "gripper_closed": self.gripper_closed,  # Fork extended/engaged
+            "has_carrier": self.has_carrier,        # Carrying a carrier
+            "fork_extended": self.z > 10,           # True when fork is extended
             "total_power_watts": round(total_power, 2),
             "total_energy_joules": round(total_energy, 4),
         }
 
 
 class VGRSimulation:
-    """Simulates the Vacuum Gripper Robot"""
+    """
+    Simulates the Vacuum Gripper Robot (VGR) - 3-Axis Gantry Robot.
+    
+    Physical Description:
+    - Located OUTSIDE on the factory floor (production area)
+    - Uses a PNEUMATIC SUCTION CUP to grip items from above
+    - Powered by a compressor that creates vacuum pressure
+    
+    Coordinate System (separate from HBW):
+    - X-axis: Horizontal movement LEFT/RIGHT across the gantry
+    - Y-axis: Horizontal movement FRONT/BACK (toward/away from conveyor)
+    - Z-axis: VERTICAL movement UP/DOWN to reach down to table/items
+             (opposite of HBW - this moves the suction cup down to grab)
+    
+    Work Stations (VGR work area):
+    - Delivery Zone: Where raw materials arrive
+    - Oven/Processing: Where items are processed
+    - Conveyor Input: Where VGR places items for HBW to pick up
+    
+    Conveyor Interface:
+    - Places items onto the INPUT side of the conveyor belt
+    - Items then travel to HBW on the output side
+    
+    The "Handshake" Flow:
+    1. VGR picks up raw item (e.g., cookie dough) from delivery zone
+    2. VGR places it on conveyor INPUT side
+    3. Conveyor moves item from VGR side → HBW side
+    4. HBW picks it up from conveyor OUTPUT side and stores in rack
+    """
+    
+    # VGR work positions (mm) - in VGR's own coordinate system
+    DELIVERY_ZONE = (0, 0, 0)        # Where raw items arrive
+    OVEN_POSITION = (150, 50, 0)     # Processing station
+    CONVEYOR_INPUT = (200, 100, 0)   # Where VGR drops items onto belt
+    
+    # Suction cup lowered height for pickup
+    PICKUP_HEIGHT_MM = 50.0
     
     def __init__(self):
-        # Position state
-        self.x: float = 0.0
-        self.y: float = 0.0
-        self.z: float = 0.0
+        # Position state (VGR's own coordinate system)
+        self.x: float = 0.0   # Left/Right on gantry
+        self.y: float = 0.0   # Front/Back toward conveyor
+        self.z: float = 0.0   # Up/Down (vertical - suction cup height)
         
         self.target_x: Optional[float] = None
         self.target_y: Optional[float] = None
         self.target_z: Optional[float] = None
         
-        # Motors
+        # Motors (3 axes for gantry movement)
         self.motors = {
-            "X": MotorSimulation("VGR_X", ElectricalModel(running_amps=1.2)),
-            "Y": MotorSimulation("VGR_Y", ElectricalModel(running_amps=1.2)),
-            "Z": MotorSimulation("VGR_Z", ElectricalModel(running_amps=0.8)),
+            "X": MotorSimulation("VGR_X", ElectricalModel(running_amps=1.2)),  # Gantry X
+            "Y": MotorSimulation("VGR_Y", ElectricalModel(running_amps=1.2)),  # Gantry Y
+            "Z": MotorSimulation("VGR_Z", ElectricalModel(running_amps=0.8)),  # Vertical lift
         }
         
-        # Pneumatics
+        # Pneumatic system (for vacuum suction)
         self.compressor = MotorSimulation("VGR_COMP", ElectricalModel(
             idle_amps=0.1,
             startup_amps=4.0,
             running_amps=2.5,
         ))
-        self.valve_open = False
-        self.vacuum_active = False
+        self.valve_open = False      # Pneumatic valve state
+        self.vacuum_active = False   # Whether suction is engaged
+        self.has_item = False        # Whether an item is held by suction
+    
+    def move_to_delivery(self):
+        """Move VGR to the delivery zone to pick up raw items"""
+        x, y, z = self.DELIVERY_ZONE
+        self.move_to(x, y, z)
+    
+    def move_to_oven(self):
+        """Move VGR to the oven/processing station"""
+        x, y, z = self.OVEN_POSITION
+        self.move_to(x, y, z)
+    
+    def move_to_conveyor(self):
+        """Move VGR to the conveyor input to drop off items"""
+        x, y, z = self.CONVEYOR_INPUT
+        self.move_to(x, y, z)
+    
+    def lower_to_pickup(self):
+        """Lower the suction cup to pickup height (Z-axis down)"""
+        self.target_z = self.PICKUP_HEIGHT_MM
+        self.motors["Z"].activate()
+    
+    def raise_suction_cup(self):
+        """Raise the suction cup back up (Z-axis to 0)"""
+        self.target_z = 0
+        self.motors["Z"].activate()
     
     def move_to(self, x: float, y: float, z: float):
         """Set target position"""
@@ -540,16 +826,17 @@ class VGRSimulation:
             self.motors["Z"].activate()
     
     def activate_vacuum(self):
-        """Activate vacuum gripper"""
+        """Activate vacuum gripper - engages suction to pick up item"""
         self.compressor.activate()
         self.valve_open = True
         self.vacuum_active = True
     
     def release_vacuum(self):
-        """Release vacuum gripper"""
+        """Release vacuum gripper - drops item"""
         self.compressor.deactivate()
         self.valve_open = False
         self.vacuum_active = False
+        self.has_item = False  # Item is released
     
     def stop(self):
         """Stop all motors"""
@@ -609,30 +896,56 @@ class VGRSimulation:
         
         return {
             "device_id": "VGR",
-            "x": round(self.x, 1),
-            "y": round(self.y, 1),
-            "z": round(self.z, 1),
+            "x": round(self.x, 1),              # Position on gantry (Left/Right)
+            "y": round(self.y, 1),              # Position toward conveyor (Front/Back)
+            "z": round(self.z, 1),              # Suction cup height (Up/Down - vertical!)
             "status": status,
             "motors": motor_states,
             "compressor": comp_state,
             "valve_open": self.valve_open,
             "vacuum_active": self.vacuum_active,
+            "has_item": self.has_item,          # Whether suction cup is holding an item
+            "suction_lowered": self.z > 10,     # True when suction cup is lowered
             "total_power_watts": round(total_power, 2),
             "total_energy_joules": round(total_energy, 4),
         }
 
 
 class MockFactory:
-    """Main factory simulation coordinating all subsystems"""
+    """
+    Main Factory Simulation - Coordinates all subsystems.
+    
+    Physical Layout:
+    ┌────────────────────────────────────────────────────────────────┐
+    │                        FACTORY FLOOR                           │
+    │                                                                │
+    │   ┌─────────────┐                      ┌─────────────────────┐ │
+    │   │             │                      │   STORAGE RACK      │ │
+    │   │     VGR     │    CONVEYOR BELT     │  ┌───┬───┬───┐      │ │
+    │   │   (Vacuum   │ ===================> │  │A1 │A2 │A3 │      │ │
+    │   │   Gripper)  │   Items flow this    │  ├───┼───┼───┤  HBW │ │
+    │   │             │   way normally       │  │B1 │B2 │B3 │(Fork)│ │
+    │   │   Suction   │                      │  ├───┼───┼───┤      │ │
+    │   │   Cup ↓↑    │   INPUT ──> OUTPUT   │  │C1 │C2 │C3 │      │ │
+    │   │             │                      │  └───┴───┴───┘      │ │
+    │   └─────────────┘                      └─────────────────────┘ │
+    │        ▲                                        ▲              │
+    │        │                                        │              │
+    │   Z = Vertical                            Z = Horizontal       │
+    │   (up/down)                               (in/out of rack)     │
+    └────────────────────────────────────────────────────────────────┘
+    
+    The two robots NEVER touch each other - the Conveyor Belt is the bridge.
+    """
     
     def __init__(self, api_url: str = API_URL, mqtt_broker: str = MQTT_BROKER):
         self.api_url = api_url
         self.mqtt_broker = mqtt_broker
         
-        # Subsystems
-        self.conveyor = ConveyorSimulation()
-        self.hbw = HBWSimulation()
-        self.vgr = VGRSimulation()
+        # Subsystems (two separate robots + conveyor bridge)
+        self.conveyor = ConveyorSimulation()  # The bridge between robots
+        self.hbw = HBWSimulation()            # Storage robot (inside rack)
+        self.vgr = VGRSimulation()            # Production robot (factory floor)
         
         # HTTP client
         self.http_client: Optional[httpx.AsyncClient] = None
@@ -900,3 +1213,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

@@ -45,9 +45,25 @@ SLOTS = ["A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "C3"]
 MOTORS = ["HBW_M1_X", "HBW_M2_Y", "CONV_M1", "VGR_M1_ARM", "VGR_M2_GRIP"]
 SENSORS = ["CONV_L1_ENTRY", "CONV_L2_PROCESS", "CONV_L3_EXIT", "CONV_L4_OVERFLOW"]
 
-# Breakdown scenarios
+# Enhanced Breakdown scenarios for ~70% system health
+BREAKDOWN_SCENARIOS = {
+    5: {"type": "MOTOR_OVERTEMP", "component": "HBW_M1_X", "severity": "MEDIUM", "health_impact": 0.08},
+    8: {"type": "SENSOR_INTERMITTENT", "component": "CONV_L1_ENTRY", "severity": "LOW", "health_impact": 0.03},
+    12: {"type": "MOTOR_FAILURE", "component": "CONV_M1", "severity": "CRITICAL", "health_impact": 0.15},
+    15: {"type": "GRIPPER_MALFUNCTION", "component": "VGR_M2_GRIP", "severity": "MEDIUM", "health_impact": 0.07},
+    18: {"type": "AXIS_VIBRATION", "component": "HBW_M2_Y", "severity": "MEDIUM", "health_impact": 0.05},
+    22: {"type": "BELT_SLIPPAGE", "component": "CONV_M1", "severity": "LOW", "health_impact": 0.04},
+    25: {"type": "SENSOR_DRIFT", "component": "CONV_L2_PROCESS", "severity": "MEDIUM", "health_impact": 0.06},
+    28: {"type": "MOTOR_BEARING_WEAR", "component": "VGR_M1_ARM", "severity": "MEDIUM", "health_impact": 0.05},
+}
+
+# Breakdown scenarios - legacy support
 BREAKDOWN_DAY_MOTOR = 12  # Day 12: Motor failure
 BREAKDOWN_DAY_SENSOR = 25  # Day 25: Sensor drift
+
+# Target system health ~70% (cumulative degradation)
+BASE_SYSTEM_HEALTH = 0.95
+DAILY_DEGRADATION = 0.008  # Natural wear per day (~70% by day 30)
 
 
 def create_session():
@@ -290,6 +306,185 @@ def simulate_motor_failure(db, day: int, base_date: datetime) -> dict:
     return motor_states
 
 
+def simulate_breakdown_scenario(db, day: int, base_date: datetime, component_health: dict) -> dict:
+    """
+    Simulate various breakdown scenarios throughout the 30 days.
+    
+    Returns updated component health states.
+    """
+    if day not in BREAKDOWN_SCENARIOS:
+        return component_health
+    
+    scenario = BREAKDOWN_SCENARIOS[day]
+    scenario_type = scenario["type"]
+    component = scenario["component"]
+    severity = scenario["severity"]
+    health_impact = scenario["health_impact"]
+    
+    print(f"  [!] Day {day}: Simulating {scenario_type} on {component}")
+    
+    # Determine alert severity
+    alert_severity = {
+        "LOW": AlertSeverity.LOW,
+        "MEDIUM": AlertSeverity.MEDIUM,
+        "CRITICAL": AlertSeverity.CRITICAL
+    }.get(severity, AlertSeverity.MEDIUM)
+    
+    # Current health before incident
+    current_health = component_health.get(component, {}).get("health", 0.95)
+    new_health = max(0.3, current_health - health_impact)
+    
+    # Generate scenario-specific data
+    if scenario_type == "MOTOR_OVERTEMP":
+        # Temperature spike scenario
+        for hour in range(3):
+            ts = base_date + timedelta(hours=10 + hour)
+            temp = 75 + (hour * 10) + random.uniform(-2, 2)  # 75°C -> 95°C
+            generate_telemetry(db, ts, component, "temperature", temp, "°C")
+            generate_telemetry(db, ts, component, "current_amps", 2.8 + random.uniform(-0.2, 0.2), "A")
+            
+            log = SystemLog(
+                timestamp=ts,
+                level=LogLevel.WARNING,
+                source="MOTOR_CONTROLLER",
+                message=f"[BREAKDOWN] {component} temperature elevated: {temp:.1f}°C (threshold: 70°C)",
+            )
+            db.add(log)
+        
+        generate_alert(
+            db, base_date + timedelta(hours=12), "OVERTEMPERATURE", alert_severity,
+            f"Motor Overtemperature: {component}",
+            f"Temperature exceeded safe operating limits. Motor throttled to prevent damage.",
+            component
+        )
+    
+    elif scenario_type == "SENSOR_INTERMITTENT":
+        # Intermittent sensor failures
+        for i in range(random.randint(5, 12)):
+            ts = base_date + timedelta(hours=random.randint(8, 18), minutes=random.randint(0, 59))
+            generate_telemetry(db, ts, component, "signal_loss", 1.0, "count")
+            
+            log = SystemLog(
+                timestamp=ts,
+                level=LogLevel.WARNING,
+                source="SENSOR",
+                message=f"[BREAKDOWN] {component} signal lost momentarily - possible wiring issue",
+            )
+            db.add(log)
+        
+        generate_alert(
+            db, base_date + timedelta(hours=14), "SENSOR_INTERMITTENT", alert_severity,
+            f"Intermittent Sensor Failure: {component}",
+            f"Multiple signal losses detected. Check wiring and connections.",
+            component
+        )
+    
+    elif scenario_type == "GRIPPER_MALFUNCTION":
+        # Vacuum gripper issues
+        for hour in range(2):
+            ts = base_date + timedelta(hours=11 + hour)
+            vacuum_pressure = 0.4 - (hour * 0.15)  # Degrading vacuum
+            generate_telemetry(db, ts, component, "vacuum_pressure", vacuum_pressure, "bar")
+            generate_telemetry(db, ts, component, "grip_success_rate", 0.7 - (hour * 0.1), "%")
+            
+            log = SystemLog(
+                timestamp=ts,
+                level=LogLevel.ERROR,
+                source="VGR_CONTROLLER",
+                message=f"[BREAKDOWN] {component} vacuum pressure low: {vacuum_pressure:.2f} bar (min: 0.5 bar)",
+            )
+            db.add(log)
+        
+        generate_alert(
+            db, base_date + timedelta(hours=13), "GRIPPER_MALFUNCTION", alert_severity,
+            f"Gripper Malfunction: {component}",
+            f"Vacuum pressure insufficient. Multiple drop events detected. Check seals and pump.",
+            component
+        )
+    
+    elif scenario_type == "AXIS_VIBRATION":
+        # Excessive vibration on axis
+        for hour in range(4):
+            ts = base_date + timedelta(hours=9 + hour)
+            vibration = 2.5 + (hour * 0.5) + random.uniform(-0.2, 0.2)  # Increasing vibration
+            generate_telemetry(db, ts, component, "vibration_rms", vibration, "mm/s")
+            
+            log = SystemLog(
+                timestamp=ts,
+                level=LogLevel.WARNING,
+                source="MOTOR_CONTROLLER",
+                message=f"[BREAKDOWN] {component} vibration elevated: {vibration:.2f} mm/s RMS (limit: 2.0 mm/s)",
+            )
+            db.add(log)
+        
+        generate_alert(
+            db, base_date + timedelta(hours=13), "EXCESSIVE_VIBRATION", alert_severity,
+            f"Excessive Vibration: {component}",
+            f"Vibration levels exceeding safe limits. Check bearings and alignment.",
+            component
+        )
+    
+    elif scenario_type == "BELT_SLIPPAGE":
+        # Conveyor belt slippage
+        for i in range(random.randint(8, 15)):
+            ts = base_date + timedelta(hours=random.randint(8, 17), minutes=random.randint(0, 59))
+            slip_amount = random.uniform(2, 8)  # mm of slippage
+            generate_telemetry(db, ts, component, "belt_slip", slip_amount, "mm")
+            
+            log = SystemLog(
+                timestamp=ts,
+                level=LogLevel.WARNING,
+                source="CONVEYOR",
+                message=f"[BREAKDOWN] Belt slippage detected: {slip_amount:.1f}mm - possible tension issue",
+            )
+            db.add(log)
+        
+        generate_alert(
+            db, base_date + timedelta(hours=15), "BELT_SLIPPAGE", alert_severity,
+            f"Belt Slippage Detected: {component}",
+            f"Multiple slippage events. Adjust belt tension or check drive roller.",
+            component
+        )
+    
+    elif scenario_type == "MOTOR_BEARING_WEAR":
+        # Bearing wear signs
+        for hour in range(6):
+            ts = base_date + timedelta(hours=8 + hour)
+            noise_db = 55 + (hour * 2) + random.uniform(-1, 1)
+            generate_telemetry(db, ts, component, "acoustic_noise", noise_db, "dB")
+            generate_telemetry(db, ts, component, "bearing_temp", 45 + (hour * 3), "°C")
+            
+            if hour >= 3:
+                log = SystemLog(
+                    timestamp=ts,
+                    level=LogLevel.WARNING,
+                    source="MOTOR_CONTROLLER",
+                    message=f"[BREAKDOWN] {component} abnormal noise: {noise_db:.0f}dB - bearing wear suspected",
+                )
+                db.add(log)
+        
+        generate_alert(
+            db, base_date + timedelta(hours=14), "BEARING_WEAR", alert_severity,
+            f"Bearing Wear Detected: {component}",
+            f"Acoustic signature indicates bearing degradation. Schedule replacement.",
+            component
+        )
+    
+    # Update component health
+    component_health[component] = {"health": new_health, "last_incident": scenario_type}
+    
+    # Generate predictive maintenance alert for components with low health
+    if new_health < 0.6:
+        generate_alert(
+            db, base_date + timedelta(hours=16), "PREDICTIVE_MAINTENANCE", AlertSeverity.MEDIUM,
+            f"Maintenance Required: {component}",
+            f"Component health at {new_health*100:.0f}%. Schedule preventive maintenance.",
+            component
+        )
+    
+    return component_health
+
+
 def simulate_sensor_drift(db, day: int, base_date: datetime) -> None:
     """
     Simulate sensor drift scenario on Day 25.
@@ -366,7 +561,10 @@ def generate_daily_data(
     """
     print(f"  Generating Day {day}: {base_date.strftime('%Y-%m-%d')}")
     
-    # Simulate breakdown scenarios
+    # Simulate ALL breakdown scenarios (new enhanced function)
+    motor_health = simulate_breakdown_scenario(db, day, base_date, motor_health)
+    
+    # Legacy breakdown scenarios
     breakdown_states = simulate_motor_failure(db, day, base_date)
     simulate_sensor_drift(db, day, base_date)
     
@@ -416,18 +614,21 @@ def generate_daily_data(
             conv_current = motor_health.get("CONV_M1", {}).get("current", random.uniform(1.0, 1.5))
             generate_energy_log(db, order_time, "CONV_M1", duration * 0.5, conv_current)
     
-    # Generate hourly motor health telemetry
+    # Generate hourly motor health telemetry with DEGRADATION
     for hour in range(24):
         ts = base_date + timedelta(hours=hour)
         
         for motor_id in MOTORS:
-            # Get or calculate health score
+            # Calculate degraded health (target ~70% by day 30)
+            # Start at 95%, degrade by ~0.8% per day = ~71% by day 30
+            base_health = BASE_SYSTEM_HEALTH - (day * DAILY_DEGRADATION)
+            
+            # Apply breakdown impacts
             if motor_id in motor_health:
-                health = motor_health[motor_id].get("health", 1.0)
+                health = motor_health[motor_id].get("health", base_health)
             else:
-                # Normal degradation: ~0.01% per hour
-                base_health = 1.0 - (day * 0.001)
-                health = max(0.5, base_health + random.uniform(-0.02, 0.02))
+                # Add random variation
+                health = max(0.45, base_health + random.uniform(-0.03, 0.02))
             
             # Normal current when not in failure
             if motor_id in motor_health and "current" in motor_health[motor_id]:
@@ -443,14 +644,28 @@ def generate_daily_data(
                 accumulated_runtime=day * 10 * 3600 + hour * 600,  # Rough estimate
             )
             
-            # Generate predictive maintenance alert if health < 0.5
-            if health < 0.5 and hour == 12:  # Check at noon
+            # Generate predictive maintenance alert if health < 0.6
+            if health < 0.6 and hour == 12:  # Check at noon
                 generate_alert(
                     db, ts, "PREDICTIVE_MAINTENANCE", AlertSeverity.MEDIUM,
                     f"Predictive Maintenance Required: {motor_id}",
                     f"Health score at {health*100:.0f}%. Schedule maintenance to prevent failure.",
                     motor_id
                 )
+    
+    # Generate daily system health summary log
+    avg_health = sum(
+        motor_health.get(m, {}).get("health", BASE_SYSTEM_HEALTH - (day * DAILY_DEGRADATION))
+        for m in MOTORS
+    ) / len(MOTORS)
+    
+    daily_summary = SystemLog(
+        timestamp=base_date + timedelta(hours=23, minutes=59),
+        level=LogLevel.INFO if avg_health > 0.7 else LogLevel.WARNING,
+        source="SYSTEM",
+        message=f"[DAILY SUMMARY] Day {day}: Orders={orders_generated}, Avg Health={avg_health*100:.1f}%",
+    )
+    db.add(daily_summary)
     
     # Commit daily data
     db.commit()
@@ -521,8 +736,10 @@ def generate_history(days: int = 30, orders_per_day: int = 50):
     print(f"System logs generated: {log_count}")
     print()
     print("Breakdown scenarios injected:")
-    print(f"  - Day {BREAKDOWN_DAY_MOTOR}: Motor Failure (CONV_M1)")
-    print(f"  - Day {BREAKDOWN_DAY_SENSOR}: Sensor Drift (CONV_L2_PROCESS)")
+    for day, scenario in BREAKDOWN_SCENARIOS.items():
+        print(f"  - Day {day}: {scenario['type']} ({scenario['component']}) - {scenario['severity']}")
+    print()
+    print(f"Target system health by Day 30: ~{(BASE_SYSTEM_HEALTH - 30*DAILY_DEGRADATION)*100:.0f}%")
     
     db.close()
 
